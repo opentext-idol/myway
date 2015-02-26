@@ -168,7 +168,7 @@ my $constant_ident   = qr/'[^']*'/;
 my $unquoted_ident = qr/
 	\@{0,2}         # optional @ or @@ for variables
 	\w+             # the ident name
-	(?:\([^\)]*\))? # optional function params
+	(?:\s*\([^\)]*\))? # optional function params
 /x;
 
 my $ident_alias = qr/
@@ -180,7 +180,7 @@ my $ident_alias = qr/
 my $function_ident = qr/
 	\b
 	(
-		\w+      # function name
+		\w+\s*   # function name
 		\(       # opening parenthesis
 		[^\)]+   # function args, if any
 		\)       # closing parenthesis
@@ -3068,6 +3068,20 @@ sub processfile( $$;$$$ ) { # {{{
 
 	close( $handle );
 
+	# It's invalid to leave a dangling statement without a terminating
+	# delimiter... but mistakes happen.  Let's try to catch this instance.
+	my $count = scalar( @{ $state -> { 'entry' } } );
+	if( $count ) {
+		pwarn( $count . " lines of data are hanging without a delimiter!" );
+
+		my $delim = DEFDELIM;
+		$delim = $state -> { 'statements' } -> { 'symbol' } if( defined( $state -> { 'statements' } -> { 'symbol' } ) );
+		pwarn( "Attempting to auto-correct by inserting '" . $delim . "' character ..." );
+
+		processline( $data, $delim, $state, $strict );
+	}
+
+	# FIXME: We haven't ever actually changed this value since it was defined...
 	return( $validated );
 } # processfile # }}}
 
