@@ -4360,7 +4360,7 @@ SQL
 						dbclose( $dbh );
 						return( TRUE );
 					} elsif( $match eq $previous ) {
-						print( "=> Skipping pre-initialiser file '$schmfile' ...\n" );
+						print( "=> Skipping pre-initialisation file '$schmfile' ...\n" );
 						dbclose( $dbh );
 						return( TRUE );
 					}
@@ -4600,7 +4600,7 @@ SQL
 						$schmprevious = undef if( defined( $schmprevious ) and ( $schmprevious =~ m#(?:na|n/a)#i ) );
 						print( "*> Read dubious prior version '$schmprevious'\n" ) unless( not( defined( $schmprevious ) ) or ( $schmprevious =~ m/[\d.]+/ ) );
 						print( "*> Read dubious target version '$schmtarget'\n" ) unless( not( defined( $schmtarget ) ) or ( $schmtarget =~ m/[\d.]+/ ) );
-						if( ( $schmfile =~ m/^(?:V(?:.*?)__)*V(.*?)__/ ) and not( $1 =~ m/^$schmtarget(?:\.\d)?$/ ) ) {
+						if( ( $schmfile =~ m/^(?:V(?:.*?)__)*V(.*?)__/ ) and not( $1 =~ m/^$schmtarget(?:\.\d+)?$/ ) ) {
 							warn( "!> $warning File-name version '$1' differs from metadata version '$schmtarget' from file '$schmfile'\n" );
 						}
 
@@ -4623,9 +4623,11 @@ SQL
 								} else {
 									warn( "!> No target version defined in metadata comments - not validating target installation chain\n" );
 								}
+
 							#} elsif( not( /^$flywaytablename$/ ~~ @{ $availabletables } ) )
 							} elsif( defined( $tablename ) and not( qr/^$tablename$/ |M| \@{ $availabletables } ) ) {
 								warn( "!> metadata table `$tablename` does not exist - not validating target installation chain\n" );
+
 							} else {
 								# N.B. Logic change - previously, we were simply checking that the target version
 								#      hasn't been applied to the database.  Now, we're checking that nothing
@@ -4640,7 +4642,6 @@ SQL
 								my $okay = TRUE;
 								my $fresh = TRUE;
 
-								#if( not( 'procedure' eq $mode ) ) {
 								#if( /^$schmtarget$/ ~~ $installedversions )
 								if( qr/^$schmtarget$/ |M| $installedversions ) {
 									if( not( $first ) and ( 'procedure' eq $mode ) ) {
@@ -4667,26 +4668,38 @@ SQL
 										$fresh = FALSE;
 									}
 								}
-								#}
+
+								my( $codeversion, $changeversion, $stepversion, $hotfixversion ) = ( $schmfile =~ m/^V([[:xdigit:]]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)__/ );
+
 								my @sortedversions = sort { versioncmp( $a, $b ) } ( @{ $installedversions }, $schmtarget );
 								my $latest = pop( @sortedversions );
 								if( not( $latest eq $schmtarget ) ) {
-									if( $pretend ) {
-										if( $force ) {
-											warn( "!> Existing " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$latest' is greater than target '$schmtarget', and has already been applied to this database - would forcibly re-apply ...\n" );
+									if( not( 'procedure' eq $mode ) and defined( $hotfixversion ) and not( $hotfixversion =~ m/0+/ ) ) {
+										if( $pretend ) {
+											warn( "!> Hot-fox Schema version '$schmtarget' would be applied onto existing Schema version '$latest' ...\n" );
 										} else {
-											warn( "!> Existing " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$latest' is greater than target '$schmtarget', and has already been applied to this database - would skip ...\n" );
+											warn( "!> Hot-fox Schema version '$schmtarget' will be applied onto existing Schema version '$latest' ...\n" );
 										}
+										print( "*> Schema version '$schmtarget' is a fresh install\n" );
+										$okay = TRUE;
 									} else {
-										if( $force ) {
-											warn( "!> Existing " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$latest' is greater than target '$schmtarget', and has already been applied to this database - forcibly applying ...\n" );
+										if( $pretend ) {
+											if( $force ) {
+												warn( "!> Existing " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$latest' is greater than target '$schmtarget', and has already been applied to this database - would forcibly re-apply ...\n" );
+											} else {
+												warn( "!> Existing " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$latest' is greater than target '$schmtarget', and has already been applied to this database - would skip ...\n" );
+											}
 										} else {
-											warn( "!> Existing " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$latest' is greater than target '$schmtarget', and has already been applied to this database - skipping ...\n" );
-											return( TRUE );
+											if( $force ) {
+												warn( "!> Existing " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$latest' is greater than target '$schmtarget', and has already been applied to this database - forcibly applying ...\n" );
+											} else {
+												warn( "!> Existing " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$latest' is greater than target '$schmtarget', and has already been applied to this database - skipping ...\n" );
+												return( TRUE );
+											}
 										}
+										$greaterversionpresent = TRUE;
+										$okay = FALSE;
 									}
-									$greaterversionpresent = TRUE;
-									$okay = FALSE;
 								} elsif( $fresh ) { # and ( $first )
 									print( "*> " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$schmtarget' is a fresh install\n" );
 								} elsif( $first ) {
@@ -4749,8 +4762,6 @@ SQL
 												if( $force ) {
 													warn( "!> Prior schema version '$schmprevious' has not been applied to this database - forcibly applying ...\n" );
 												} else {
-warn( " > DEBUG: \$installedversions:\n" );
-print Data::Dumper -> Dump( [ $installedversions ], [ qw( *versions ) ] );
 													die( "Prior schema version '$schmprevious' (required by '$schmfile') has not been applied to this database - aborting.\n" );
 												}
 											}
