@@ -3070,7 +3070,7 @@ sub processfile( $$;$$$ ) { # {{{
 
 	# It's invalid to leave a dangling statement without a terminating
 	# delimiter... but mistakes happen.  Let's try to catch this instance.
-	my $count = scalar( @{ $state -> { 'entry' } } );
+	my $count = scalar( @{ $state -> { 'statements'} -> { 'entry' } } ) if( defined( $state -> { 'statements' } -> { 'entry' } ) );
 	if( $count ) {
 		pwarn( $count . " lines of data are hanging without a delimiter!" );
 
