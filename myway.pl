@@ -178,12 +178,12 @@ my $ident_alias = qr/
 /xi;
 
 my $function_ident = qr/
-	\b
+	\s*
 	(
-		\w+\s*   # function name
-		\(       # opening parenthesis
-		[^\)]+   # function args, if any
-		\)       # closing parenthesis
+		(?:\b\w+|`\w+`)\s*    # function name
+		\(                    # opening parenthesis
+		[^\)]*                # function args, if any
+		\)                    # closing parenthesis
 	)
 /x;
 
@@ -870,7 +870,7 @@ sub parse_columns( $$ ) { # {{{
 		# ... so explicit_alias is missing, and $2 is in $3.
 		#
 		if ($cols =~ m/\G\s*$column_ident\s*(?>,|\Z)/gcxo) {
-warn "SQL DEBUG: " .
+warn "SQL DEBUG: (1) " .
 	( defined( $1 ) ? "\$1(db_tbl_col) is '$1'" : '' ) .
 	( defined( $2 ) ? ", \$2(unused) is '$2'" : '' ) .
 	( defined( $3 ) ? ", \$3(as) is '$3'" : '' ) .
@@ -895,7 +895,7 @@ warn "SQL DEBUG: " .
 		# Update: Moved to position 2
 		elsif ($cols =~ m/\G\s*$function_ident\s*(?>,|\Z)/gcxo) {
 			my ($select_expr) = $1;
-warn "SQL DEBUG: " .
+warn "SQL DEBUG: (2) " .
 	( defined( $1 ) ? "\$1(db_tbl_col) is '$1'" : '' ) .
 	( defined( $2 ) ? ", \$2(as) is '$2'" : '' ) .
 	( defined( $3 ) ? ", \$3(alias) is '$3'" : '' ) .
@@ -917,7 +917,7 @@ warn "SQL DEBUG: " .
 		# than a simple column-reference...
 		elsif ($cols =~ m/\G\s*(.+?)$ident_alias\s*(?>,|\Z)/gcxo) {
 			my ($select_expr, $as, $alias) = ($1, $2, $3); # XXX
-warn "SQL DEBUG: " .
+warn "SQL DEBUG: (3) " .
 	( defined( $1 ) ? "\$1(db_tbl_col) is '$1'" : '' ) .
 	( defined( $2 ) ? ", \$2(as) is '$2'" : '' ) .
 	( defined( $3 ) ? ", \$3(alias) is '$3'" : '' ) .
