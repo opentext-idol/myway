@@ -4349,20 +4349,28 @@ SQL
 			#            ^^^         ^^^         ^^^    ^^^
 			#
 			my $version = getsqlvalue( $dbh, "SELECT `version` FROM `$flywaytablename`  WHERE `success` = '1' AND `type` = 'INIT' ORDER BY `version` DESC LIMIT 1" );
-			if( $schmfile =~ m/^V(.*?)__/ ) {
-				my $match = $1;
-				my @sortedversions = sort { versioncmp( $a, $b ) } ( $version, $match );
-				my $latest = pop( @sortedversions );
-				my $previous = pop( @sortedversions );
+			if( not( defined( $version ) and length( $version ) ) ) {
 				if( not( $force ) ) {
-					if( ( $match eq $latest ) and ( $latest eq $previous ) ) {
-						print( "=> Skipping base initialiser file '$schmfile' ...\n" );
-						dbclose( $dbh );
-						return( TRUE );
-					} elsif( $match eq $previous ) {
-						print( "=> Skipping pre-initialisation file '$schmfile' ...\n" );
-						dbclose( $dbh );
-						return( TRUE );
+					die( "Database has not been initialised with this tool - please re-run with '--init' and the appropriate schema-file version number.\n" );
+				} else {
+					warn( "!> Database has not been initialised with this tool - will force-apply file '$schmfile' ...\n" );
+				}
+			} else {
+				if( $schmfile =~ m/^V(.*?)__/ ) {
+					my $match = $1;
+					my @sortedversions = sort { versioncmp( $a, $b ) } ( $version, $match );
+					my $latest = pop( @sortedversions );
+					my $previous = pop( @sortedversions );
+					if( not( $force ) ) {
+						if( ( $match eq $latest ) and ( $latest eq $previous ) ) {
+							print( "=> Skipping base initialiser file '$schmfile' ...\n" );
+							dbclose( $dbh );
+							return( TRUE );
+						} elsif( $match eq $previous ) {
+							print( "=> Skipping pre-initialisation file '$schmfile' ...\n" );
+							dbclose( $dbh );
+							return( TRUE );
+						}
 					}
 				}
 			}
