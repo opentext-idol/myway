@@ -4233,8 +4233,8 @@ sub applyschema( $$$$;$ ) { # {{{
 						}
 					}
 				}
-			}
-			if( not( defined( $init ) ) or ( 0 == $init ) ) {
+
+			} elsif( not( defined( $init ) ) or ( 0 == $init ) ) {
 				$versionrank = getsqlvalue( $dbh, "SELECT MAX(`version_rank`) FROM `$flywaytablename`" );
 				if( defined( $versionrank ) and $versionrank =~ m/^\d+$/ and $versionrank >= 0 ) {
 					$versionrank++;
@@ -4349,20 +4349,28 @@ SQL
 			#            ^^^         ^^^         ^^^    ^^^
 			#
 			my $version = getsqlvalue( $dbh, "SELECT `version` FROM `$flywaytablename`  WHERE `success` = '1' AND `type` = 'INIT' ORDER BY `version` DESC LIMIT 1" );
-			if( $schmfile =~ m/^V(.*?)__/ ) {
-				my $match = $1;
-				my @sortedversions = sort { versioncmp( $a, $b ) } ( $version, $match );
-				my $latest = pop( @sortedversions );
-				my $previous = pop( @sortedversions );
+			if( not( defined( $version ) and length( $version ) ) ) {
 				if( not( $force ) ) {
-					if( ( $match eq $latest ) and ( $latest eq $previous ) ) {
-						print( "=> Skipping base initialiser file '$schmfile' ...\n" );
-						dbclose( $dbh );
-						return( TRUE );
-					} elsif( $match eq $previous ) {
-						print( "=> Skipping pre-initialisation file '$schmfile' ...\n" );
-						dbclose( $dbh );
-						return( TRUE );
+					die( "Database has not been initialised with this tool - please re-run with '--init' and the appropriate schema-file version number.\n" );
+				} else {
+					warn( "!> Database has not been initialised with this tool - will force-apply file '$schmfile' ...\n" );
+				}
+			} else {
+				if( $schmfile =~ m/^V(.*?)__/ ) {
+					my $match = $1;
+					my @sortedversions = sort { versioncmp( $a, $b ) } ( $version, $match );
+					my $latest = pop( @sortedversions );
+					my $previous = pop( @sortedversions );
+					if( not( $force ) ) {
+						if( ( $match eq $latest ) and ( $latest eq $previous ) ) {
+							print( "=> Skipping base initialiser file '$schmfile' ...\n" );
+							dbclose( $dbh );
+							return( TRUE );
+						} elsif( $match eq $previous ) {
+							print( "=> Skipping pre-initialisation file '$schmfile' ...\n" );
+							dbclose( $dbh );
+							return( TRUE );
+						}
 					}
 				}
 			}
@@ -4454,27 +4462,50 @@ SQL
 	# TODO: Backup Stored Procedures also?
 	if( $statements and not( ( 'procedure' eq $mode ) or $unsafe ) ) {
 		if( $dumpusers ) {
+
+			# I can't imagine that this will change any time soon,
+			# but I guess it's not impossible that at some future
+			# time `maria` is the system database... ?
+			my $systemdb = 'mysql';
+
 			if( $pretend ) {
 				print( "\nS> User alterations detected - would back-up MySQL `users` tables.\n" );
 			} else {
 				#if( not( /^mysql$/ ~~ @{ $availabledatabases } ) )
-				if( not( qr/^mysql$/ |M| \@{ $availabledatabases } ) ) {
-					warn( "`mysql` database does not appear to exist.  Detected databases were:\n" );
+				if( not( qr/^$systemdb$/ |M| \@{ $availabledatabases } ) ) {
+					warn( "`$systemdb` database does not appear to exist.  Detected databases were:\n" );
 					foreach my $database ( @{ $availabledatabases } ) {
 						warn( "\t$database\n" );
 					}
 					die( "Aborting\n" );
 				}
 
-				my @usertables = [ 'columns_priv', 'procs_priv', 'proxies_priv', 'tables_priv', 'user' ];
+				#
+				# Populate list of system tables, for user-backup purposes
+				#
+
+				my $availablesystemtables;
+
+				print( "\n=> Connecting to database `$systemdb` ...\n" );
+				my $systemdsn = "DBI:mysql:database=$systemdb;host=$host;port=$port";
+				my $systemdbh;
+				my $systemerror = dbopen( \$systemdbh, $systemdsn, $user, $pass, $strict );
+				die( $systemerror ."\n" ) if $systemerror;
+
+				$availablesystemtables = getsqlvalues( $systemdbh, "SHOW TABLES" );
+				warn( "Unable to retrieve list of tables for database `$systemdb`" . ( defined( $systemdbh -> errstr() ) ? ': ' . $systemdbh -> errstr() : '' ) . "\n" ) unless( scalar( $availablesystemtables ) );
+
+				dbclose( $systemdbh );
+
+				my @usertables = ( 'columns_priv', 'procs_priv', 'proxies_priv', 'tables_priv', 'user' );
 				my @backuptables;
 				my $showtables = FALSE;
 				foreach my $table ( @usertables ) {
-					#if( not( /^$table$/ ~~ @{ $availabletables } ) )
-					if( qr/^$table$/ |M| \@{ $availabletables } ) {
+					#if( not( /^$table$/ ~~ @{ $availablesystemtables } ) )
+					if( qr/^$table$/ |M| \@{ $availablesystemtables } ) {
 						push( @backuptables, $table );
 					} else {
-						warn( "`$table` table does not appear to exist in `mysql` database.\n" );
+						warn( "`$table` table does not appear to exist in `$systemdb` database.\n" );
 						$showtables = TRUE;
 					}
 				}
@@ -4492,9 +4523,9 @@ SQL
 					  'user'	=> $user
 					, 'password'	=> $pass
 					, 'host'	=> $host
-					, 'database'	=> 'mysql'
+					, 'database'	=> $systemdb
 				};
-				dbdump( $auth, @backuptables, $tmpdir, "mysql.userpriv.$uuid.sql" ) or die( "Database backup failed - aborting\n" );
+				dbdump( $auth, \@backuptables, $tmpdir, "mysql.userpriv.$uuid.sql" ) or die( "Database backup failed - aborting\n" );
 
 				print( "\n=> MySQL table backups completed\n" );
 			}
@@ -4676,9 +4707,9 @@ SQL
 								if( not( $latest eq $schmtarget ) ) {
 									if( not( 'procedure' eq $mode ) and defined( $hotfixversion ) and not( $hotfixversion =~ m/0+/ ) ) {
 										if( $pretend ) {
-											warn( "!> Hot-fox Schema version '$schmtarget' would be applied onto existing Schema version '$latest' ...\n" );
+											warn( "!> Hot-fix Schema version '$schmtarget' would be applied onto existing Schema version '$latest' ...\n" );
 										} else {
-											warn( "!> Hot-fox Schema version '$schmtarget' will be applied onto existing Schema version '$latest' ...\n" );
+											warn( "!> Hot-fix Schema version '$schmtarget' will be applied onto existing Schema version '$latest' ...\n" );
 										}
 										print( "*> Schema version '$schmtarget' is a fresh install\n" );
 										$okay = TRUE;
