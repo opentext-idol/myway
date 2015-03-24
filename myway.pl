@@ -165,10 +165,15 @@ my $quoted_ident   = qr/`[^`]+`/;
 # '' is a valid constant...
 #my $constant_ident   = qr/'[^']+'/;
 my $constant_ident   = qr/'[^']*'/;
+#my $unquoted_ident = qr/
+#	\@{0,2}         # optional @ or @@ for variables
+#	\w+             # the ident name
+#	(?:\s*\([^\)]*\))? # optional function params
+#/x;
 my $unquoted_ident = qr/
 	\@{0,2}         # optional @ or @@ for variables
 	\w+             # the ident name
-	(?:\s*\([^\)]*\))? # optional function params
+	(?:\s*$RE{ balanced }{ -parens => '()' })? # optional function params
 /x;
 
 my $ident_alias = qr/
@@ -177,13 +182,20 @@ my $ident_alias = qr/
   ((?>$quoted_ident|$unquoted_ident)) # alais
 /xi;
 
+#my $function_ident = qr/
+#	\s*
+#	(
+#		(?:\b\w+|`\w+`)\s*    # function name
+#		\(                    # opening parenthesis
+#		[^\)]*                # function args, if any
+#		\)                    # closing parenthesis
+#	)
+#/x;
 my $function_ident = qr/
 	\s*
 	(
 		(?:\b\w+|`\w+`)\s*    # function name
-		\(                    # opening parenthesis
-		[^\)]*                # function args, if any
-		\)                    # closing parenthesis
+		$RE{ balanced }{ -parens => '()' }
 	)
 /x;
 
@@ -456,7 +468,7 @@ sub parse_delete( $$ ) { # {{{
 	my ( $self, $query ) = @_;
 	if ( $query =~ s/FROM\s+//i ) {
 		my $keywords = qr/(LOW_PRIORITY|QUICK|IGNORE)/i;
-		my $clauses  = qr/(FROM|WHERE|ORDER BY|LIMIT)/i;
+		my $clauses  = qr/(FROM|WHERE|ORDER\s+BY|LIMIT(?:\s+\d+))/i;
 		return $self->_parse_query($query, $keywords, 'from', $clauses);
 	}
 	else {
@@ -714,6 +726,11 @@ sub parse_insert( $$ ) { # {{{
 
 			$string =~ s/^\s*\(\s*\Q$cols\E\s*\)\s*//;
 			#$string =~ s/^\s*\(\s*$cols\s*\)\s*//;
+		} else {
+			# Insert into no columns!?
+			# Can apparently be used to create a new ID in an
+			# auto-increment column of a table...
+			$string =~ s/^\s*\(\s*\)\s*//;
 		}
 	}
 
@@ -807,7 +824,7 @@ sub parse_select( $$ ) { # {{{
 		|GROUP\s+BY
 		|HAVING
 		|ORDER\s+BY
-		|LIMIT
+		|LIMIT(?:\s+\d+)
 		|PROCEDURE
 		|INTO\s+OUTFILE
 	)/xi;
@@ -823,7 +840,7 @@ sub parse_update( $$ ) { # {{{
 	my ( $self, $query ) = @_;
 
 	my $keywords = qr/(LOW_PRIORITY|IGNORE)/i;
-	my $clauses  = qr/(SET|WHERE|ORDER\s+BY|LIMIT)/i;
+	my $clauses  = qr/(SET|WHERE|ORDER\s+BY|LIMIT(?:\s+\d+))/i;
 
 	return $self->_parse_query($query, $keywords, 'tables', $clauses);
 } # parse_update # }}}
@@ -862,6 +879,19 @@ sub parse_columns( $$ ) { # {{{
 	my @cols;
 	pos $cols = 0;
 	while (pos $cols < length $cols) {
+MKDEBUG && _d("At position '" . ( ( pos $cols ) or 0 ) . "' of ", length $cols);
+		if ($cols =~ m/\G\s*(__SQ\d+__)\s*(?>,|\Z)/gcxo) {
+warn "SQL DEBUG: (4) " .
+	( defined( $1 ) ? "\$1(db_tbl_col) is '$1'" : '' ) .
+	( defined( $2 ) ? ", \$2(unused) is '$2'" : '' ) .
+	( defined( $3 ) ? ", \$3(unused) is '$3'" : '' ) .
+	( defined( $4 ) ? ", \$4(unused) is '$4'" : '' ) .
+	( defined( $5 ) ? ", \$4(unused) is '$5'" : '' ) .
+	"." if SQLDEBUG;
+			MKDEBUG && _d("Passing-through expression with compressed element \"$1\"");
+			my $col_struct = { expr => $1, (), () };
+			push @cols, $col_struct;
+		}
 		# XXX: Looking at it, the alias/col/tbl hash is lacking either
 		#      the col(umn) or the alias name, because only three
 		#      values are stored :(
@@ -869,7 +899,21 @@ sub parse_columns( $$ ) { # {{{
 		# jobs.id AS id -> { alias => 'AS', col => 'id', tbl => 'jobs' }
 		# ... so explicit_alias is missing, and $2 is in $3.
 		#
-		if ($cols =~ m/\G\s*$column_ident\s*(?>,|\Z)/gcxo) {
+		elsif ($cols =~ m/\G\s*($RE{ balanced }{ -parens => '()' })\s*(?>,|\Z)/gcxo) {
+			my ($select_expr) = $1;
+warn "SQL DEBUG: (5) " .
+	( defined( $1 ) ? "\$1(db_tbl_col) is '$1'" : '' ) .
+	( defined( $2 ) ? ", \$2(unused) is '$2'" : '' ) .
+	( defined( $3 ) ? ", \$3(unused) is '$3'" : '' ) .
+	( defined( $4 ) ? ", \$4(unused) is '$4'" : '' ) .
+	( defined( $5 ) ? ", \$4(unused) is '$5'" : '' ) .
+	"." if SQLDEBUG;
+			# See comments for $function_ident(2) below
+			MKDEBUG && _d("Cannot fully parse expression \"$select_expr\"");
+			my $col_struct = { expr => $select_expr, (), () };
+			push @cols, $col_struct;
+		}
+		elsif ($cols =~ m/\G\s*$column_ident\s*(?>,|\Z)/gcxo) {
 warn "SQL DEBUG: (1) " .
 	( defined( $1 ) ? "\$1(db_tbl_col) is '$1'" : '' ) .
 	( defined( $2 ) ? ", \$2(unused) is '$2'" : '' ) .
@@ -879,14 +923,18 @@ warn "SQL DEBUG: (1) " .
 	"." if SQLDEBUG;
 			#my ($db_tbl_col, $as, $alias) = ($1, $2, $3); # XXX
 			my ($db_tbl_col, $as, $alias) = ($1, $3, $4); # XXX
+			#MKDEBUG && _d("column identifier:", Dumper(\$db_tbl_col));
 			my $ident_struct = $self->parse_identifier('column', $db_tbl_col);
-			$alias =~ s/`//g if $alias;
-			my $col_struct = {
-				%$ident_struct,
-				($as    ? (explicit_alias => 1)      : ()),
-				($alias ? (alias          => $alias) : ()),
-			};
-			push @cols, $col_struct;
+			#MKDEBUG && _d("resulting column identifier struct:", Dumper(\$ident_struct));
+			if (defined $ident_struct) {
+				$alias =~ s/`//g if defined $alias and length $alias;
+				my $col_struct = {
+					%$ident_struct,
+					($as    ? (explicit_alias => 1)      : ()),
+					($alias ? (alias          => $alias) : ()),
+				};
+				push @cols, $col_struct;
+			}
 		}
 		# Furthermore, if the LHS of a SELECT statement is actually a
 		# function-call rather than an alias at all, then we need to
@@ -937,6 +985,12 @@ warn "SQL DEBUG: (3) " .
 				($as    ? (explicit_alias => 1)      : ()),
 				($alias ? (alias          => $alias) : ()),
 			};
+			push @cols, $col_struct;
+		}
+		elsif ($cols =~ m/\G\s*(.+?)(.*)\s*(?>,|\Z)/gcxo) {
+			my ($select_expr) = $1;
+			MKDEBUG && _d("Cannot parse expression \"$select_expr\"");
+			my $col_struct = { expr => $select_expr, (), () };
 			push @cols, $col_struct;
 		}
 		else {
@@ -1125,13 +1179,14 @@ sub parse_having( $$ ) { # {{{
 
 sub parse_identifier( $$$ ) { # {{{
 	my ( $self, $type, $ident ) = @_;
-	return unless $type && $ident;
+	return unless defined $type && length $type && defined $ident && length $ident;
 	MKDEBUG && _d("Parsing", $type, "identifier:", $ident);
 
 	if ( $ident =~ m/^\w+\(/ ) {  # Function like MIN(col)
 		my ($func, $expr) = $ident =~ m/^(\w+)\(([^\)]*)\)/;
 		MKDEBUG && _d('Function', $func, 'arg', $expr);
 		return { col => $ident } unless $expr;  # NOW()
+		return { col => $expr } if( $expr =~ m/,/ ); # FIXME: Multiple arguments, which can't be trivially split as below...
 		$ident = $expr;  # col from MAX(col)
 	}
 
@@ -1139,19 +1194,22 @@ sub parse_identifier( $$$ ) { # {{{
 	my @ident_parts = map { s/`//g; $_; } split /[.]/, $ident;
 	if ( @ident_parts == 3 ) {
 		@ident_struct{qw(db tbl col)} = @ident_parts;
+		#MKDEBUG && _d($type, "identifier 3 parts:", Dumper(\%ident_struct));
 	}
 	elsif ( @ident_parts == 2 ) {
 		my @parts_for_type = $type eq 'column' ? qw(tbl col)
 							    : $type eq 'table'  ? qw(db  tbl)
 							    : die "Invalid identifier type: $type";
 		@ident_struct{@parts_for_type} = @ident_parts;
+		#MKDEBUG && _d($type, "identifier 2 parts:", Dumper(\%ident_struct));
 	}
 	elsif ( @ident_parts == 1 ) {
 		my $part = $type eq 'column' ? 'col' : 'tbl';
 		@ident_struct{($part)} = @ident_parts;
+		#MKDEBUG && _d($type, "identifier 1 part:", Dumper(\%ident_struct));
 	}
 	else {
-		die "Invalid number of parts in $type reference: $ident";
+		die "Invalid number of parts '" . scalar( @ident_parts ) . "' in $type reference: $ident\n" . Dumper(\@ident_parts);
 	}
 
 	if ( $self->{Schema} ) {
@@ -1169,7 +1227,7 @@ sub parse_identifier( $$$ ) { # {{{
 		}
 	}
 
-	MKDEBUG && _d($type, "identifier struct:", Dumper(\%ident_struct));
+	MKDEBUG && _d($type, "return identifier struct:", Dumper(\%ident_struct));
 	return \%ident_struct;
 } # parse_identifier # }}}
 
@@ -1435,20 +1493,38 @@ sub parse_where( $$ ) {
 	my $op_symbol = qr/
 		(?:
 		 <=(?:>)?
-		|>=
-		|<>
-		|!=
-		|<
-		|>
+		|^
+		|~
+		|<(?:<|>)?
 		|=
+		|>(?:>|=)?
+		|-
+		|:=
+		|!(?:=)?
+		|\|(?:\|)?
+		|\/
+		|\*
+		|\+
+		|&(?:&)?
+		|%
+		|AND
+		|BINARY
+		|CASE
+		|DIV
+		|MOD
+		|NOT
+		|OR
+		|XOR
 	)/xi;
 	my $op_verb = qr/
 		(?:
-			 (?:(?:NOT\s)?LIKE)
-			|(?:IS(?:\sNOT\s)?)
-			|(?:(?:\sNOT\s)?BETWEEN)
-			|(?:(?:NOT\s)?IN)
-			|(?:(?:NOT\s)?EXISTS)
+			 (?:(?:NOT\s+)?LIKE)
+			|(?:IS(?:\s+NOT\s*)?)
+			|(?:(?:NOT\s+)?BETWEEN)
+			|(?:(?:NOT\s+)?IN)
+			|(?:(?:NOT\s+)?EXISTS)
+			|(?:(?:NOT\s+)?(?:REGEXP|RLIKE))
+			|(?:SOUNDS\s+LIKE)
 		)
 	/xi;
 	my $op_pat = qr/
@@ -1510,8 +1586,12 @@ sub parse_where( $$ ) {
 		my $n_single_quotes = ($pred =~ tr/'//);
 		my $n_double_quotes = ($pred =~ tr/"//);
 		if ( ($n_single_quotes % 2) || ($n_double_quotes % 2) ) {
-			$pred[$i]     .= $pred[$i + 1];
-			$pred[$i + 1]  = undef;
+			if( defined( $pred[$i + 1] ) ) {
+				$pred[$i]     .= $pred[$i + 1];
+				$pred[$i + 1]  = undef;
+			} else {
+				MKDEBUG && _d("Predicate fragments cannot be balanced on quotes:", Dumper(\@pred));
+			}
 		}
 	}
 	MKDEBUG && _d("Predicate fragments balanced:", Dumper(\@pred));
@@ -1900,6 +1980,9 @@ sub _parse_clauses( $$ ) {
 			$clause = $clause_no_space;
 		}
 
+		# XXX: Hack to work around LIMIT gaining first argument bug
+		$clause =~ s/_\d+$//;
+
 		my $parse_func     = "parse_$clause";
 		$struct->{$clause} = $self->$parse_func($struct->{clauses}->{$clause});
 
@@ -1923,6 +2006,7 @@ sub _parse_csv( $$$ ) {
 
 	my @vals;
 	if ( $args{quoted_values} ) {
+MKDEBUG && _d("Parsing values:", Dumper(\%args));
 		# If the vals are quoted, then they can contain commas, like:
 		# "hello, world!", 'batman'.  If only we could use Text::CSV,
 		# then I wouldn't write yet another csv parser to handle this,
@@ -1992,8 +2076,41 @@ sub _parse_csv( $$$ ) {
 		}
 	}
 	else {
-		@vals = map { s/^\s+//; s/\s+$//; $_ } split(',', $vals);
+		my $filteredline = $vals;
+		my $strchanged = 0; # FALSE
+		my $index = 0;
+		my @savedterms;
+		foreach my $match ( ( $vals =~ m/$RE{ balanced }{ -parens => '()' }/g ) ) {
+			$filteredline =~ s/\Q$match\E/__MW_STR_${index}__/;
+			MKDEBUG && _d("Replacing '$match' with '__MW_STR_${index}__' to give '$filteredline'");
+			$index++;
+			$savedterms[ $index ] = $match;
+			$strchanged = 1; # TRUE
+		}
+
+		if( !( $strchanged ) ) {
+			@vals = map { s/^\s+//; s/\s+$//; $_ } split(',', $vals);
+		} else {
+			MKDEBUG && _d("Quote-reduced line is now:", $filteredline) if( $strchanged );
+
+			my @compressedvals = map { s/^\s+//; s/\s+$//; $_ } split(',', $filteredline);
+
+			foreach my $val ( @compressedvals ) {
+				while( $val =~ m/__MW_STR_(\d+)__/ ) {
+					my $position = $1;
+					if( $position >= $index ) {
+						die( "Read placeholder string '$position' beyond maximum seen '$index'\n" );
+					}
+					my $replacement = $savedterms[ $position ];
+					$replacement = '' unless( defined( $replacement ) and length( $replacement ) );
+					$val =~ s/__MW_STR_${position}__/$replacement/;
+					MKDEBUG && _d("Replacing '__MW_STR_${position}__' with '$replacement' to give '$val'");
+				}
+				push( @vals, $val );
+			}
+		}
 	}
+MKDEBUG && _d("Parsed values:", Dumper(\@vals));
 
 	return \@vals;
 }
@@ -2026,7 +2143,7 @@ sub _parse_query( $$$$$ ) {
 	my $struct = {};
 
 	# Save, remove keywords.
-	1 while $query =~ s/(?:^|\s+)$keywords\s+/$struct->{keywords}->{lc $1}=1, ''/gie;
+	1 while $query =~ s/(?:^|\s+)(?:$RE{quoted}\s+)?$keywords(?:\s+$RE{quoted})?\s+/$struct->{keywords}->{lc $1}=1, ''/gie;
 
 	# Go clausing.
 	my @clause = grep { defined $_ }
@@ -2360,7 +2477,7 @@ sub compressquotes( $$ ) { # {{{
 	my( $line, $state ) = @_;
 
 	#my @quo = @{ $state -> { 'quo' } };
-	my $quochanged = FALSE;
+	#my $quochanged = FALSE;
 
 	## Try to isolate any quoted text (to be expanded out later) so that we
 	## aren't trying to comment-check user-data...
@@ -2395,7 +2512,8 @@ sub compressquotes( $$ ) { # {{{
 		$strchanged = TRUE;
 		pdebug( "  q Replacing '$match' with '__MW_STR_${index}__' to give '$filteredline'" );
 	}
-	pdebug( "  q Quote-reduced line is now '$filteredline'" ) if( $quochanged or $strchanged );
+	#pdebug( "  q Quote-reduced line is now '$filteredline'" ) if( $quochanged or $strchanged );
+	pdebug( "  q Quote-reduced line is now '$filteredline'" ) if( $strchanged );
 
 	return( $filteredline );
 } # compressquotes # }}}
@@ -2928,7 +3046,7 @@ sub processline( $$;$$ ) { # {{{
 			# $item contains a complete SQL statement, or the end
 			# of a previously started one...
 			#
-			my( $pre, $post ) = split( /\Q$delim\E/, $line );
+			my( $pre, $post ) = split( /\Q$delim\E/, $line, 2 );
 			$pre =~ s/^\s+//; $pre =~ s/\s+$//;
 			$post =~ s/^\s+//; $post =~ s/\s+$//;
 
@@ -2998,7 +3116,9 @@ sub processline( $$;$$ ) { # {{{
 			undef( $state -> { 'statements' } -> { 'type' } );
 			undef( $state -> { 'statements' } -> { 'entry' } );
 
-			if( length( $post ) ) {
+			if( length( $post ) and not( $post eq $delim and not( length( $pre ) ) ) ) {
+				pdebug( "  S Follow-on section is '$post'" );
+
 				return( processline( $data, $post, $state, $strict ) )
 			} else {
 				return( undef );
@@ -4081,7 +4201,7 @@ sub applyschema( $$$$;$ ) { # {{{
 
 				if( not( defined( $entry -> { 'tokens' } ) ) ) {
 					# FIXME: Filter known edge-cases which the Parser fails to tokenise...
-					if( not( $text =~ m/^((LOCK|UNLOCK|SET|CREATE PROCEDURE|GRANT) |\s*\/\*\!)/i ) ) {
+					if( not( $text =~ m/^((LOCK|UNLOCK|SET|CREATE\s+PROCEDURE|GRANT|TRUNCATE)\s+|\s*\/\*\!)/i ) ) {
 						$output -> ( 'Unable to parse ' . $texttype . 'entry "' . $text . '"' );
 						# FIXME: Don't abort simply because we hit something we can't parse...
 						#$invalid = TRUE;
