@@ -3932,7 +3932,12 @@ sub formatastable( $$$ ) { # {{{
 	if( 0 == $firstchildpidorzero ) {
 		# Child process
 
-		setpgrp( 0, 0 );
+		# Will likely fail on non-UNIX systems - perlport(1) declares
+		# 'setpgrp' as unimplemented on 'Win32, VMS, RISC OS, VOS'.
+		#
+		eval {
+			setpgrp( 0, 0 );
+		};
 
 		$read -> close();
 
@@ -4768,7 +4773,7 @@ SQL
 								$status = "'$status'";
 							}
 
-							if( not( defined( $schmtarget ) ) ) {
+							if( not( defined( $schmtarget ) and length( $schmtarget ) ) ) {
 								if( not( 'procedure' eq $mode ) ) {
 									warn( "!> No target version defined in schema comments - relying on filename alone\n" );
 								} else {
@@ -5710,7 +5715,9 @@ sub main( @ ) { # {{{
 			if( 0 == $firstchildpidorzero ) {
 				# Child process
 
-				setpgrp( 0, 0 );
+				eval {
+					setpgrp( 0, 0 );
+				};
 
 				# ... this now goes on to perform the
 				# backup.
@@ -5723,7 +5730,9 @@ sub main( @ ) { # {{{
 				if( 0 == $secondchildpidorzero ) {
 					# Second child process
 
-					setpgrp( 0, 0 );
+					eval {
+						setpgrp( 0, 0 );
+					};
 
 					local $| = 1;
 
@@ -6018,8 +6027,17 @@ sub main( @ ) { # {{{
 			@files = @{ $target };
 		} else {
 			#@files = i3_keysort { ( my $version = $_ ) =~ s/^V([\d.])+__.*$/$1/; return( split( /\./, $version ) ); } @{ $target };
-			#my @sortedfiles = sort { ( $a =~ /V([\d.]+)__/ )[ 0 ] <=> ( $b =~ /V([\d.]+)__/ )[ 0 ] } @{ $target };
-			@files = sort { versioncmp( ( $a =~ /V([\d.]+)__/ )[ 0 ], ( $b =~ /V([\d.]+)__/ )[ 0 ] ) } @{ $target };
+			#my @sortedfiles = sort { ( $a =~ /^V([\d.]+)__/ )[ 0 ] <=> ( $b =~ /^V([\d.]+)__/ )[ 0 ] } @{ $target };
+                        foreach my $index ( 0 .. scalar( @{ $target } ) ) {
+                                my $file = @{ $target }[ $index ];
+                                if( not( length( $file ) ) or ( $file =~ m/^\s*$/ ) ) {
+                                        delete @{ $target }[ $index ];
+                                } else {
+                                        my $version = ( $file  =~ /V([\d.]+)__/ )[ 0 ];
+                                        warn( "$warning Target '$file' has invalid name without an identifiable version" ) unless ( defined( $version ) and length( $version ) );
+                                }
+                        }
+                        @files = sort { versioncmp( ( $a =~ /V([\d.]+)__/ )[ 0 ], ( $b =~ /V([\d.]+)__/ )[ 0 ] ) } @{ $target };
 		}
 	}
 
