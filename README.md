@@ -46,3 +46,10 @@ The most significant diversion from Flyway is that the Flyway 'schema_version'
 metadata table contains a 'checksum' field which is never populated in myway,
 as we instead store an sha1sum of the source file in the 'myway_schema_version'
 myway metadata table.
+
+Also included are `applyschema.sh` and `schema.conf`, which allow `myway.pl` to
+be invoked once to migrate a multitude of databases, based on the content of
+the included configuration file.
+
+This shell script requires [stdlib.sh](https://github.com/srcshelton/stdlib.sh)
+which can be deployed simply by copying `stdlib.sh` to `/usr/local/lib/`.
