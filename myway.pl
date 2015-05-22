@@ -1866,9 +1866,9 @@ MKDEBUG && _d("SQ: Inner start $inner_start, Inner end $inner_end");
 				MKDEBUG && _d("Outermost subquery");
 			}
 		}
-print Dumper @start_pos;
-print Dumper @end_pos;
-print Dumper @subqueries;
+MKDEBUG && _d('SQ: start_pos:', Dumper(\@start_pos));
+MKDEBUG && _d('SQ: end_pos:', Dumper(\@end_pos));
+MKDEBUG && _d('SQ: subqueries:', Dumper(\@subqueries));
 
 		my $len    = $end_pos[$i] - $start_pos[$i] - $len_adj;
 		MKDEBUG && _d("Subquery $n start " . $start_pos[$i] .
@@ -2220,7 +2220,7 @@ no if ( $] >= 5.02 ), warnings => 'experimental::autoderef';
 # ... in actual fact, diagnostics causes more problems than it solves.  It does
 # appear to be, in reality, quite silly.
 
-use constant VERSION  =>  1.0.11;
+use constant VERSION  =>  1.0.12;
 
 use constant TRUE     =>  1;
 use constant FALSE    =>  0;
