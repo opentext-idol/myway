@@ -2466,7 +2466,8 @@ sub initstate() { # {{{
 	my @str = ();
 
 	my %state = (
-		  'symbol'	=>       undef	# Used to hold the closing characters of a multi-line comment or statement delimiter
+		  'file'	=>	 undef	# Current filename, for logging purposes
+		, 'symbol'	=>       undef	# Used to hold the closing characters of a multi-line comment or statement delimiter
 		, 'depth'	=>       0	# Comment nesting depth
 		, 'line'	=>	 0	# Line of input on which current entry starts
 		, 'type'	=>	 undef	# Entry type: comment, statement, or fragment
@@ -2752,7 +2753,7 @@ sub processcomments( $$$;$ ) { # {{{
 			my $regex = $start . '.*$';
 
 			eval { qr/$regex/ };
-			die( "$fatal Invalid regex '$regex': $@\n" ) if( $@ );
+			die( "$fatal Invalid regex '$regex'" . ( ( defined( $state -> { 'file' } ) and length( $state -> { 'file' } ) ) ? " in file '" . $state -> { 'file' } . "'" : '' ) . ": $@\n" ) if( $@ );
 
 			pdebug( "  C Checking for multi-line initial token '$regex' ..." );
 
@@ -2827,7 +2828,7 @@ sub processcomments( $$$;$ ) { # {{{
 
 
 	} else { # ( 0 != $state -> { 'depth' } )
-		die( "$fatal Logic error" ) unless( defined( $state -> { 'symbol' } ) );
+		die( "$fatal Logic error" . ( ( defined( $state -> { 'file' } ) and length( $state -> { 'file' } ) ) ? " in file '" . $state -> { 'file' } . "'" : '' ) ) unless( defined( $state -> { 'symbol' } ) );
 
 		pdebug( "  C In a comment, depth " . $state -> { 'depth' } . " ..." );
 
@@ -3087,9 +3088,9 @@ sub processline( $$;$$ ) { # {{{
 			my $tokens;
 			if( $command =~ m/^USE\s+`?(.+?)`?$/i ) {
 				if( defined( $strict ) and $strict ) {
-					die( "$fatal Not parsing prohibited command '$command'\n" );
+					die( "$fatal Not parsing prohibited command '$command'" . ( ( defined( $state -> { 'file' } ) and length( $state -> { 'file' } ) ) ? " from file '" . $state -> { 'file' } . "'" : '' ) . "\n" );
 				} else {
-					warn( "$warning Not parsing prohibited command '$command'\n" );
+					warn( "$warning Not parsing prohibited command '$command'" . ( ( defined( $state -> { 'file' } ) and length( $state -> { 'file' } ) ) ? " from file '" . $state -> { 'file' } . "'" : '' ) . "\n" );
 				}
 
 			} elsif( $command =~ m/^\s*$delim\s*$/ ) {
@@ -3103,7 +3104,10 @@ sub processline( $$;$$ ) { # {{{
 				# easily-confused parser is less likely to
 				# become flummoxed.
 				my @replacements;
-				my $filteredcommand = $command;
+
+				# Handle escaped quotes, which confuse parsing.
+				( my $filteredcommand = $command ) =~ s/''/__MW_LITERAL_QUOTE__/g;
+
 				foreach my $match ( ( $filteredcommand =~ m/$RE{ quoted }/g ) ) {
 					# $RE{quoted} also captures back-ticks,
 					# which we need to maintain...
@@ -3112,6 +3116,12 @@ sub processline( $$;$$ ) { # {{{
 					# Keep external quotes...
 					$match =~ s/^['"]//;
 					$match =~ s/['"]$//;
+
+					# As we're maintaining external
+					# quoting, tokens consisting entirely
+					# of whitespace - and especially quoted
+					# single spaces - can cause issues...
+					next if( $match =~ m/^\s*$/ );
 
 					my $index = scalar( @replacements );
 					$filteredcommand =~ s/\Q$match\E/__MW_TOK_${index}__/;
@@ -3123,15 +3133,18 @@ sub processline( $$;$$ ) { # {{{
 					$tokens = $sqlparser -> parse( $filteredcommand, $delim );
 				};
 				if( $@ ) {
+					( my $errortext = $@ ) =~ s/\.$//;
+					chomp( $errortext );
+
 					if( defined( $strict ) and $strict ) {
-						if( $@ =~ m/Cannot parse .* queries/ ) {
-							warn( $@ . "\n" );
+						if( $errortext =~ m/Cannot parse .* queries/ ) {
+							warn( $errortext . ( ( defined( $state -> { 'file' } ) and length( $state -> { 'file' } ) ) ? " in file '" . $state -> { 'file' } . "'" : '' ) . "\n" );
 							$state -> { 'statements' } -> { 'tokens' } = undef;
 						} else {
-							die( $@ . "\n" );
+							die( "\n" . $errortext . ( ( defined( $state -> { 'file' } ) and length( $state -> { 'file' } ) ) ? " in file '" . $state -> { 'file' } . "'" : '' ) . "\n" );
 						}
 					} else {
-						warn( $@ . "\n" );
+						warn( $errortext . ( ( defined( $state -> { 'file' } ) and length( $state -> { 'file' } ) ) ? " in file '" . $state -> { 'file' } . "'" : '' ) . "\n" );
 						$state -> { 'statements' } -> { 'tokens' } = undef;
 					}
 				} else {
@@ -3169,6 +3182,8 @@ sub processline( $$;$$ ) { # {{{
 								my $original = ${ $strref };
 								if( ${ $strref } =~ s/__MW_TOK_${index}__/$match/ ) {
 									pdebug( "  S Replaced \`__MW_TOK_${index}__\` in \`$original\` with \`$match\` to give \`${ $strref }\`" );
+								} elsif( ${ $strref } =~ s/__MW_LITERAL_QUOTE__/''/ ) {
+									pdebug( "  S Replaced \`__MW_LITERAL_QUOTE__\` in \`$original\` with \`''\` to give \`${ $strref }\`" );
 								}
 							}
 						}
@@ -3225,6 +3240,8 @@ sub processfile( $$;$$$ ) { # {{{
 
 	my $state = initstate();
 	my $validated = TRUE;
+
+	$state -> { 'file' } = $file;
 
 	pdebug( "processfile() invoked on file '$file'" );
 
