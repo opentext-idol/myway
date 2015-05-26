@@ -3113,18 +3113,26 @@ sub processline( $$;$$ ) { # {{{
 					# which we need to maintain...
 					next if( $match =~ m/^\`.*\`$/ );
 
-					# Keep external quotes...
-					$match =~ s/^['"]//;
-					$match =~ s/['"]$//;
+					if( not( length( $match ) > 2 ) ) {
+						pdebug( "  S Quoted string `$match` is too short to process - skipping further processing of this token" );
+						next;
+					}
 
-					# As we're maintaining external
-					# quoting, tokens consisting entirely
-					# of whitespace - and especially quoted
-					# single spaces - can cause issues...
-					next if( $match =~ m/^\s*$/ );
+					my $qu = substr( $match, 0, 1 );
+					my $te = substr( $match, -1, 1 );
+					if( $qu ne $te ) {
+						pdebug( "  S Found differing quoted string delimiters `$qu` and `$te` - skipping further processing string `$match`" );
+						next;
+					} elsif( not( $qu =~ m/['"]/ ) ) {
+						pwarn( "  S Token string delimiter `$qu` is not recognised - skipping further processing string `$match`" );
+						next;
+					}
+					# Keep external quotes...
+					$match =~ s/^$qu//;
+					$match =~ s/$te$//;
 
 					my $index = scalar( @replacements );
-					$filteredcommand =~ s/\Q$match\E/__MW_TOK_${index}__/;
+					$filteredcommand =~ s/$qu\Q$match\E$te/${qu}__MW_TOK_${index}__${te}/;
 					push( @replacements, $match );
 					pdebug( "  S Replacing \`$match\` with \`__MW_TOK_${index}__\` to give \`$filteredcommand\`" );
 				}
@@ -3138,13 +3146,13 @@ sub processline( $$;$$ ) { # {{{
 
 					if( defined( $strict ) and $strict ) {
 						if( $errortext =~ m/Cannot parse .* queries/ ) {
-							warn( $errortext . ( ( defined( $state -> { 'file' } ) and length( $state -> { 'file' } ) ) ? " in file '" . $state -> { 'file' } . "'" : '' ) . "\n" );
+							warn( "!> " . $errortext . ( ( defined( $state -> { 'file' } ) and length( $state -> { 'file' } ) ) ? " in file '" . $state -> { 'file' } . "'" : '' ) . "\n" );
 							$state -> { 'statements' } -> { 'tokens' } = undef;
 						} else {
 							die( "\n" . $errortext . ( ( defined( $state -> { 'file' } ) and length( $state -> { 'file' } ) ) ? " in file '" . $state -> { 'file' } . "'" : '' ) . "\n" );
 						}
 					} else {
-						warn( $errortext . ( ( defined( $state -> { 'file' } ) and length( $state -> { 'file' } ) ) ? " in file '" . $state -> { 'file' } . "'" : '' ) . "\n" );
+						warn( "!> " . $errortext . ( ( defined( $state -> { 'file' } ) and length( $state -> { 'file' } ) ) ? " in file '" . $state -> { 'file' } . "'" : '' ) . "\n" );
 						$state -> { 'statements' } -> { 'tokens' } = undef;
 					}
 				} else {
@@ -3181,16 +3189,16 @@ sub processline( $$;$$ ) { # {{{
 							if( defined( $match ) and length( $match ) ) {
 								my $original = ${ $strref };
 								if( ${ $strref } =~ s/__MW_TOK_${index}__/$match/ ) {
-									pdebug( "  S Replaced \`__MW_TOK_${index}__\` in \`$original\` with \`$match\` to give \`${ $strref }\`" );
+									pdebug( "  S Replaced \`__MW_TOK_${index}__\` from tokenised hash leaf value \`$original\` with \`$match\` to give \`${ $strref }\`" );
 								} elsif( ${ $strref } =~ s/__MW_LITERAL_QUOTE__/''/ ) {
-									pdebug( "  S Replaced \`__MW_LITERAL_QUOTE__\` in \`$original\` with \`''\` to give \`${ $strref }\`" );
+									pdebug( "  S Replaced \`__MW_LITERAL_QUOTE__\` from tokenised hash leaf value \`$original\` with \`''\` to give \`${ $strref }\`" );
 								}
 							}
 						}
 					}, \@replacements );
 
 					$state -> { 'statements' } -> { 'tokens' } = $tokens;
-					print Data::Dumper -> Dump( [ $tokens ], [ qw( *tokens ) ] ) if DEBUG;
+					#print Data::Dumper -> Dump( [ $tokens ], [ qw( *tokens ) ] ) if DEBUG;
 				}
 
 				pdebug( "  S Pushing resultant statements array ..." );
@@ -4780,6 +4788,11 @@ SQL
 				print( "=> Updating myway timing metadata for invocation '$uuid' due to " . ( ( $dumpusers or( scalar( @dumptables ) ) ) ? "backups completed" : "SQL execution starting" ) . " ...\n" );
 				my $sql = "UPDATE `$mywaytablename` SET `sqlstarted` = SYSDATE() WHERE `id` = '$uuid'";
 				dosql( $dbh, $sql ) or die( "Closing statement execution failed\n" );
+
+				if( 'procedure' eq $mode ) {
+					print( "=> Committing transaction data\n" );
+					dosql( $dbh, "COMMIT" ) or die( "Failed to commit transaction\n" );
+				}
 			}
 		#}
 	}
@@ -5149,7 +5162,7 @@ SQL
 							# Last statement was not DDL, so we can still
 							# roll-back.
 
-						} else { # not( defined( $laststatementwasddl ) ) or $laststatementwasddl
+						} elsif( not( 'procedure' eq $mode ) ) { # not( defined( $laststatementwasddl ) ) or $laststatementwasddl
 							# Last statement was DDL, (or this is our
 							# first statement) so start a new
 							# transaction...
@@ -5168,7 +5181,7 @@ SQL
 								# Last statement was also DDL, so we
 								# can't make use of transactions.
 
-							} else { # not( $laststatementwasddl )
+							} elsif( not( 'procedure' eq $mode ) ) { # not( $laststatementwasddl )
 								# Last statement wasn't DDL, so end
 								# that transaction...
 
@@ -5295,14 +5308,17 @@ SQL
 				die( "Unknown statement type '" . $statement -> { 'type' } . "'\n" );
 			}
 			print( "\n" ) if( $verbosity );
+		} # foreach my $statement ( @{ $entry } )
+
+		if( not( 'procedure' eq $mode ) ) {
+			if( $pretend ) {
+				print( "S> Would commit transaction data\n" );
+			} else {
+				print( "=> Committing transaction data\n" );
+				dosql( $dbh, "COMMIT" ) or die( "Failed to commit transaction\n" );
+			}
 		}
-		if( $pretend ) {
-			print( "S> Would commit transaction data\n" );
-		} else {
-			print( "=> Committing transaction data\n" );
-			dosql( $dbh, "COMMIT" ) or die( "Failed to commit transaction\n" );
-		}
-	}
+	} # foreach my $entry ( $data -> { 'entries' } )
 
 	my $schemaelapsed = tv_interval( $schemastart, [ gettimeofday() ] );
 
