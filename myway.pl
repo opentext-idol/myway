@@ -192,7 +192,6 @@ my $ident_alias = qr/
 #	)
 #/x;
 my $function_ident = qr/
-	\s*
 	(
 		(?:\b\w+|`\w+`)\s*    # function name
 		$RE{ balanced }{ -parens => '()' }
@@ -215,6 +214,7 @@ my $column_ident = qr/(?:
 )/xo;
 
 my %ignore_function = (
+	IN    => 1,
 	INDEX => 1,
 	KEY   => 1,
 );
