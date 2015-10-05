@@ -42,7 +42,7 @@ function lock() {
 } # lock
 
 function main() {
-	local myway="$( std::requires --path "${SCRIPT}" )"
+	local myway="$( source "${std_LIBPATH}/${std_LIB}" 2>/dev/null ; std::requires --path "${SCRIPT}" )"
 
 	local truthy="^(on|y(es)?|true|1)$"
 	local falsy="^(off|n(o)?|false|0)$"
@@ -52,7 +52,7 @@ function main() {
 	local lockfile="/var/lock/${NAME}.lock"
 
 	# Ensure that 'fuser' will work...
-	(( EUID )) && die "This script must be run with super-user privileges"
+	#(( EUID )) && die "This script must be run with super-user privileges"
 
 	local -i novsort=0
 	if ! sort -V <<<"" >/dev/null 2>&1; then
@@ -65,7 +65,7 @@ function main() {
 	fi
 
 	local arg schema db dblist
-	local -i dryrun=0 quiet=0 silent=0
+	local -i dryrun=0 quiet=0 silent=0 keepgoing=0
 	local -a extra
 	while [[ -n "${1:-}" ]]; do
 		arg="${1}"
@@ -106,6 +106,9 @@ function main() {
 					dblist="${1}"
 				fi
 				;;
+			--keep-going|--keepgoing|-k)
+				keepgoing=1
+				;;
 			--dry-run|--verify|-v)
 				dryrun=1
 				;;
@@ -116,7 +119,7 @@ function main() {
 				silent=1
 				;;
 			--help|-h)
-				export std_USAGE="[--config <file>] [--schema <path>] [--only <database>[,...]] [--dry-run] [--silent] | [--locate <database>]"
+				export std_USAGE="[--config <file>] [--schema <path>] [--only <database>[,...]] [--keep-going] [--dry-run] [--silent] | [--locate <database>]"
 				std::usage
 				;;
 			--)
@@ -140,9 +143,9 @@ function main() {
 		die "Cannot read configuration file"
 	fi
 
-	local defaults="$( std::getfilesection "${filename}" "DEFAULT" | sed -r 's/#.*$// ; /^[^[:space:]]+\.[^[:space:]]+\s*=/s/\./_/' | grep -Ev '^\s*$' | sed -r 's/\s*=\s*/=/' )"
-	local hosts="$( std::getfilesection "${filename}" "CLUSTERHOSTS" | sed -r 's/#.*$// ; /^[^[:space:]]+\.[^[:space:]]+\s*=/s/\./_/' | grep -Ev '^\s*$' | sed -r 's/\s*=\s*/=/' )"
-	local databases="$( std::getfilesection "${filename}" "DATABASES" | sed -r 's/#.*$// ; /^[^[:space:]]+\.[^[:space:]]+\s*=/s/\./_/' | grep -Ev '^\s*$' | sed -r 's/\s*=\s*/=/' )"
+	local defaults="$( source "${std_LIBPATH}/${std_LIB}" 2>/dev/null ; std::getfilesection "${filename}" "DEFAULT" | sed -r 's/#.*$// ; /^[^[:space:]]+\.[^[:space:]]+\s*=/s/\./_/' | grep -Ev '^\s*$' | sed -r 's/\s*=\s*/=/' )"
+	local hosts="$( source "${std_LIBPATH}/${std_LIB}" 2>/dev/null ; std::getfilesection "${filename}" "CLUSTERHOSTS" | sed -r 's/#.*$// ; /^[^[:space:]]+\.[^[:space:]]+\s*=/s/\./_/' | grep -Ev '^\s*$' | sed -r 's/\s*=\s*/=/' )"
+	local databases="$( source "${std_LIBPATH}/${std_LIB}" 2>/dev/null ; std::getfilesection "${filename}" "DATABASES" | sed -r 's/#.*$// ; /^[^[:space:]]+\.[^[:space:]]+\s*=/s/\./_/' | grep -Ev '^\s*$' | sed -r 's/\s*=\s*/=/' )"
 
 	[[ -n "${databases:-}" ]] || die "No databases defined in '${filename}'"
 
@@ -154,7 +157,7 @@ function main() {
 		local name="$( grep -om 1 "^${db}$" <<<"${databases}" )"
 		[[ -n "${name:-}" ]] || die "Unknown database '${db}'"
 
-		local details="$( std::getfilesection "${filename}" "${name}" | sed -r 's/#.*$// ; /^[^[:space:]]+\.[^[:space:]]+\s*=/s/\./_/' | grep -Ev '^\s*$' | sed -r 's/\s*=\s*/=/' )"
+		local details="$( source "${std_LIBPATH}/${std_LIB}" 2>/dev/null ; std::getfilesection "${filename}" "${name}" | sed -r 's/#.*$// ; /^[^[:space:]]+\.[^[:space:]]+\s*=/s/\./_/' | grep -Ev '^\s*$' | sed -r 's/\s*=\s*/=/' )"
 		[[ -n "${details:-}" ]] || die "Unconfigured database '${db}'"
 		debug "${db}:\n${details}\n"
 
@@ -203,7 +206,7 @@ function main() {
 			continue
 		fi
 
-		local details="$( std::getfilesection "${filename}" "${db}" | sed -r 's/#.*$// ; /^[^[:space:]]+\.[^[:space:]]+\s*=/s/\./_/' | grep -Ev '^\s*$' | sed -r 's/\s*=\s*/=/' )"
+		local details="$( source "${std_LIBPATH}/${std_LIB}" 2>/dev/null ; std::getfilesection "${filename}" "${db}" | sed -r 's/#.*$// ; /^[^[:space:]]+\.[^[:space:]]+\s*=/s/\./_/' | grep -Ev '^\s*$' | sed -r 's/\s*=\s*/=/' )"
 		[[ -n "${details:-}" ]] || die "Unconfigured database '${db}'"
 		debug "${db}:\n${details}\n"
 
@@ -221,7 +224,9 @@ function main() {
 		[[ -n "${dbadmin:-}" ]] || messages+=( "No database user ('dbadmin') specified for database '${db}'" )
 		[[ -n "${passwd:-}" ]] || messages+=( "No database user password ('passwd') specified for database '${db}'" )
 
-		local actualpath
+		local actualpath="${path:-}"
+		path="$( readlink -e "${actualpath:-.}" )" || die "Failed to canonicalise path '${actualpath}': ${?}"
+		actualpath=""
 
 		if [[ -z "${path:-}" ]]; then
 			messages+=( "Path to schema files and stored procedures not defined for database '${db}'" )
@@ -247,11 +252,19 @@ function main() {
 					if [[ ! -d "${path}"/schema/"${db}" ]]; then
 						messages+=( "Cannot determine schema-files path for database '${db}'" )
 					else
-						debug "Using schema-files path '${path}/schema/${db}' for database '${db}'"
+						if [[ -d "${path}"/schema/"${db}"/"${db}" ]]; then
+                                                        actualpath="${path}"/schema/"${db}"/"${db}"
+                                                        debug "Using schema-files path '${actualpath}' for database '${db}'"
+
+                                                else
+                                                        debug "Using schema-files path '${path}/schema/${db}' for database '${db}'"
+                                                fi
 						if grep -Eq "${truthy}" <<<"${procedures:-}"; then
 							#if [[ -d "${path}"/procedures/"${db}" ]]; then
 							#	debug "Using '${path}/procedures/${db}' for '${db}' Stored Procedures"
-							if (( $( find "${path}"/procedures/ -mindepth 1 -maxdepth 1 -type d -name "${db}*" 2>/dev/null | wc -l ) )); then
+							if [[ -n "${actualpath:-}" && -d "${actualpath}"/../procedures ]]; then
+								debug "Using Stored Procedures path '$( readlink -e "${actualpath}/../procedures" )' for database '${db}'"
+							elif (( $( find "${path}"/procedures/ -mindepth 1 -maxdepth 1 -type d -name "${db}*" 2>/dev/null | wc -l ) )); then
 								debug "Using Stored Procedures path '${path}/procedures' for database '${db}'"
 							else
 								messages+=( "Cannot determine Stored Procedures path for database '${db}'" )
@@ -281,7 +294,7 @@ function main() {
 		local -a params=( -u "${dbadmin}" -p "${passwd}" -h "${host}" -d "${db}" )
 		local -a extraparams
 		local option
-		for option in force verbose warn debug; do
+		for option in force verbose warn debug quiet silent; do
 			eval echo "\${options_${option}}" | grep -Eq "${truthy}" && params+=( --${option} )
 		done
 		for option in compat relaxed; do
@@ -298,60 +311,142 @@ function main() {
 			grep -Eq "${truthy}" <<<"${backups_keeplock:-}" && params+=( --keep-lock )
 
 		fi
+
+		# Initialise databases first, as they must be present before
+		# Stored Procedures are loaded.
+		#
+		(( silent )) || info "Launching '${SCRIPT}' to perform database initialisation for database '${db}' ..."
+		extraparams=()
 		if [[ -n "${actualpath:-}" ]]; then
 			extraparams=( --scripts "${actualpath}/"*.sql )
 		else
 			extraparams=( --scripts "${path}/schema/${db}/"*.sql )
 		fi
-		if (( ${#extra[@]} )); then
+		#if (( ${#extra[@]} )); then
+		if [[ -n "${extra[*]:-}" ]]; then
 			extraparams+=( "${extra[@]}" )
 		fi
 
-		(( silent )) || info "Launching '${SCRIPT}' to perform database migration for database '${db}' ..."
-		debug "About to apply schema: '${myway} ${params[@]} ${extraparams[@]}'"
+		debug "About to prepare schema: '${myway} ${params[*]} ${extraparams[*]}'"
+		local -i allowfail=0
 		if (( ! dryrun )); then
+			if mysql -u "${dbadmin}" -p "${passwd}" -h "${host}" "${db}" <<<'QUIT' >/dev/null 2>&1; then
+				# We may still have an empty database with no
+				# metadata tracking tables...
+				allowfail=1
+			fi
 			if (( silent )); then
 				${myway} "${params[@]}" "${extraparams[@]}" --init >/dev/null 2>&1
-				${myway} "${params[@]}" "${extraparams[@]}" >/dev/null 2>&1
 			elif (( quiet )); then
 				${myway} "${params[@]}" "${extraparams[@]}" --init 2>&1 >/dev/null | grep -Ev --line-buffered "${silentfilter}"
-				${myway} "${params[@]}" "${extraparams[@]}" 2>&1 >/dev/null | grep -Ev --line-buffered "${silentfilter}"
 			else
 				${myway} "${params[@]}" "${extraparams[@]}" --init
-				${myway} "${params[@]}" "${extraparams[@]}"
+			fi
+			if (( ${?} )); then
+				if (( allowfail )); then
+					info "Initialisation of database '${db}' (${myway} ${params[*]} ${extraparams[*]}) expected failure: ${?}"
+				else
+					if (( keepgoing )); then
+						warn "Initialisation of database '${db}' (${myway} ${params[*]} ${extraparams[*]}) failed: ${?}"
+						rc=1
+					else
+						die "Initialisation of database '${db}' (${myway} ${params[*]} ${extraparams[*]}) failed: ${?}"
+					fi
+				fi
 			fi
 		fi
+
+		# Load stored-procedures next, as references to tables aren't
+		# checked until the SP is actually executed, but SPs may be
+		# invoked as part of schema deployment.
+		#
 		if grep -Eq "${truthy}" <<<"${procedures:-}"; then
-			params+=( --mode procedure )
+			local -a procparams=( --mode procedure )
 			if [[ -n "${procedures_marker:-}" ]]; then
-				params+=( --substitute --marker "${procedures_marker}" )
+				procparams+=( --substitute --marker "${procedures_marker}" )
 			else
-				params+=( --substitute )
+				procparams+=( --substitute )
 			fi
+
 			local -a reorder=( sort -V )
 			if (( novsort )); then
 				reorder=( tac )
 			fi
-			find "${path}"/procedures/ -mindepth 1 -maxdepth 1 -type d -name "${db}_*" 2>/dev/null | "${reorder[@]}" | while read -r path; do
-				extraparams=( --scripts "${path}" )
-				if (( ${#extra[@]} )); then
+
+			local procedurepath="${path}/procedures"
+			if [[ -d "${path}"/schema/"${db}"/procedures ]]; then
+				procedurepath="${path}"/schema/"${db}"/procedures
+			fi
+
+			find "${procedurepath}" -mindepth 1 -maxdepth 1 -type d -name "${db}_*" 2>/dev/null | "${reorder[@]}" | while read -r path; do
+				extraparams=()
+				extraparams+=( --scripts "${path}" )
+				#if (( ${#extra[@]} )); then
+				if [[ -n "${extra[*]:-}" ]]; then
 					extraparams+=( "${extra[@]}" )
 				fi
-				debug "About to apply Stored Procedures: ${myway} ${params[@]} ${extraparams[@]} ${extra[@]:-}"
+
+				debug "About to apply Stored Procedures: ${myway} ${params[*]} ${procparams[*]} ${extraparams[*]} ${extra[*]:-}"
 				if (( ! dryrun )); then
 					if (( silent )); then
-						${myway} "${params[@]}" "${extraparams[@]}" >/dev/null 2>&1
+						${myway} "${params[@]}" "${procparams[@]}" "${extraparams[@]}" >/dev/null 2>&1
 					elif (( quiet )); then
-						${myway} "${params[@]}" "${extraparams[@]}" 2>&1 >/dev/null | grep -Ev --line-buffered "${silentfilter}"
+						${myway} "${params[@]}" "${procparams[@]}" "${extraparams[@]}" 2>&1 >/dev/null | grep -Ev --line-buffered "${silentfilter}"
 					else
-						${myway} "${params[@]}" "${extraparams[@]}"
+						${myway} "${params[@]}" "${procparams[@]}" "${extraparams[@]}"
+					fi
+				fi
+				if (( ${?} )); then
+					if (( keepgoing )); then
+						warn "Loading of stored procedures to database '${db}' (${myway} ${params[*]} ${procparams[*]} ${extraparams[*]}${extra[*]:+ ${extra[*]}}) failed: ${?}"
+						rc=1
+					else
+						die "Loading of stored procedures to database '${db}' (${myway} ${params[*]} ${extraparams[*]}${extra[*]:+ ${extra[*]}}) failed: ${?}"
 					fi
 				fi
 			done
 		fi
+
+		# ... and finally, perform schema deployment.
+		#
+		(( silent )) || info "Launching '${SCRIPT}' to perform database migration for database '${db}' ..."
+		extraparams=()
+		if [[ -n "${actualpath:-}" ]]; then
+			extraparams=( --scripts "${actualpath}/"*.sql )
+		else
+			extraparams=( --scripts "${path}/schema/${db}/"*.sql )
+		fi
+		#if (( ${#extra[@]} )); then
+		if [[ -n "${extra[*]:-}" ]]; then
+			extraparams+=( "${extra[@]}" )
+		fi
+
+		debug "About to apply schema: '${myway} ${params[@]} ${extraparams[@]}'"
+		if (( ! dryrun )); then
+			if (( silent )); then
+				${myway} "${params[@]}" "${extraparams[@]}" >/dev/null 2>&1
+			elif (( quiet )); then
+				${myway} "${params[@]}" "${extraparams[@]}" 2>&1 >/dev/null | grep -Ev --line-buffered "${silentfilter}"
+			else
+				${myway} "${params[@]}" "${extraparams[@]}"
+			fi
+			if (( ${?} )); then
+				if (( keepgoing )); then
+					warn "Initialisation of database '${db}' (${myway} ${params[*]} ${extraparams[*]}) failed: ${?}"
+					rc=1
+				else
+					die "Initialisation of database '${db}' (${myway} ${params[*]} ${extraparams[*]}) failed: ${?}"
+				fi
+			fi
+		fi
+
 		debug "Load completed for database '${db}'\n"
 
+		(( rc )) && false
+
 		) # <- Syntax highlight fail
+
+		rc=${?}
 	done
 
 	(( std_TRACE )) && set +o xtrace
@@ -360,7 +455,15 @@ function main() {
 	debug "Releasing lock ..."
 	[[ -e "${lockfile}" && "$( <"${lockfile}" )" == "${$}" ]] && rm "${lockfile}"
 
-	(( silent )) || info "Load completed"
+	(( silent )) || {
+		# We've lost ${rc} by now... need to think about this about
+		# this a bit more...
+		if (( rc )); then
+			warn "Load completed with errors"
+		else
+			info "Load completed"
+		fi
+	}
 
 	return ${rc}
 } # main

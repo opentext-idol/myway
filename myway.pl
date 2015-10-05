@@ -214,6 +214,7 @@ my $column_ident = qr/(?:
 )/xo;
 
 my %ignore_function = (
+	NOT   => 1,
 	IN    => 1,
 	INDEX => 1,
 	KEY   => 1,
@@ -2263,6 +2264,7 @@ use Sort::Versions;
 use Time::HiRes qw( gettimeofday tv_interval );
 
 use Data::Dumper;
+use Devel::StackTrace;
 
 # Modules not currently used in latest code:
 #use Clone qw( clone );
@@ -2309,6 +2311,7 @@ our $fatal   = "FATAL:";
 our $warning = "WARN: ";
 
 our $verbosity = 0;
+our $reduceoutput = FALSE;
 
 
 our $flywaytablename = 'schema_version';
@@ -2613,9 +2616,16 @@ sub checkentry( $$;$$ ) { # {{{
 sub pushentry( $$$$$;$ ) { # {{{
 	my( $data, $state, $type, $entry, $description, $line ) = @_;
 
+	if( $entry =~ m/__MW_(STR|L?TOK|LITERAL_QUOTE_)_/ ) {
+		warn "\nUnexpended token detected in `$entry`\n";
+		my $trace = Devel::StackTrace -> new;
+		print $trace -> as_string;
+		die "Tokenisation failed\n";
+	}
+
 	$line = $. unless( defined( $line ) );
 
-	pdebug( "  E Adding " . ( defined( $description ) ? $description . ' ' : '' ) . "entry '$entry' of type '$type' from line $line ..." );
+	pdebug( "  E Adding " . ( defined( $description ) ? lc( $description ) . ' ' : '' ) . "entry '$entry' of type '$type' from line $line ..." );
 
 	checkentry( $data, $state, $description, $line );
 
@@ -2669,6 +2679,13 @@ sub pushstate( $$ ) { # {{{
 
 sub pushfragment( $$$;$$ ) { # {{{
 	my( $state, $type, $entry, $description, $line ) = @_;
+
+	if( $entry =~ m/__MW_(STR|L?TOK|LITERAL_QUOTE_)_/ ) {
+		warn "\nUnexpended token detected in `$entry`\n";
+		my $trace = Devel::StackTrace -> new;
+		print $trace -> as_string;
+		die "Tokenisation failed\n";
+	}
 
 	$line = $. unless( defined( $line ) );
 
@@ -2954,6 +2971,8 @@ sub processcomments( $$$;$ ) { # {{{
 sub processline( $$;$$ ) { # {{{
 	my( $data, $line, $state, $strict ) = @_;
 
+	sub walk( $$;$ );
+
 	if( not( defined( $state ) ) ) {
 		$state -> { 'comments' } = initstate();
 		$state -> { 'statements' } = initstate();
@@ -2988,6 +3007,22 @@ sub processline( $$;$$ ) { # {{{
 
 	pdebug( "  S Line '$line' should contain a statement..." );
 
+	sub walk( $$;$ ) { # {{{
+		my ( $element, $block, $vars ) = @_;
+
+		my $type = ref( $element );
+
+		if( 'HASH' eq $type ) {
+			walk( $_, $block, $vars ) for( values( %$element ) );
+		} elsif( 'ARRAY' eq $type ) {
+			walk( $_, $block, $vars ) for( @$element );
+		} elsif( ( 'SCALAR' eq $type ) or ( '' eq $type ) ) {
+			$block -> ( \$_[ 0 ], $vars );
+		} else {
+			die "Unknown type '$type'";
+		}
+	} # walk # }}}
+
 	if( $line =~ m/^\s*delimiter\s+([^\s]+)\s*(.*)$/i ) {
 		my $delim = $1;
 		$line = $2;
@@ -3001,7 +3036,7 @@ sub processline( $$;$$ ) { # {{{
 			$tokens = $sqlparser -> parse( "DELIMITER $delim" );
 		};
 		if( $@ ) {
-			warn( $@ . "\n" );
+			warn( $@ . "\n" ) if( length( $@ ) );
 			$state -> { 'statements' } -> { 'tokens' } = undef;
 		} else {
 			$state -> { 'statements' } -> { 'tokens' } = $tokens;
@@ -3030,36 +3065,141 @@ sub processline( $$;$$ ) { # {{{
 
 	# We have an issue where a lone delimiter will cause the entire
 	# 'foreach' block below to be skipped, meaning that the statement
-	# termianted by the delimiter on a line by itself is never processed.
+	# terminated by the delimiter on a line by itself is never processed.
 	# Rather than duplicate a chunk of code for this case, we cheat and add
 	# a second delimiter - an entirely safe operation - which causes
 	# 'foreach' to process the intervening space character!
+	my $trailingdelim = FALSE;
 	if( $line =~ m/^\s*$delim\s*$/ ) {
 		pdebug( "  S Expanding trailing delimiter '$delim'..." );
 		$line = $delim . ' ' . $delim;
+		$trailingdelim = TRUE;
 	}
 
-	foreach my $item ( split( /\Q$delim\E/, $line ) ) {
+	if( $line =~ m/^\s*$/ ) {
+		pdebug( "  S Skipping blank line '$line' ..." );
+		return( undef );
+	}
 
-		#pdebug( "  S Split item '$item' from line '$line'..." );
+	# A quoted sting could contain $delim, in which case literal splits
+	# on $delim will break things - so, unfortunately, it looks as if we're
+	# going to have to tokenise the active string /again/ ...
 
-		if( $line =~ m/^\s*$/ ) {
-			pdebug( "  S Skipping blank segment '$line' ..." );
-			return( undef );
+	my @linereplacements;
+	# Handle escaped quotes, which confuse parsing.
+	( my $filteredline = $line ) =~ s/''/__MW_LITERAL_QUOTE__/g;
+
+	foreach my $match ( ( $filteredline =~ m/$RE{ quoted }/g ) ) {
+		# $RE{quoted} also captures back-ticks,
+		# which we need to maintain...
+		next if( $match =~ m/^\`.*\`$/ );
+
+		if( not( length( $match ) > 2 ) ) {
+			pdebug( "  S Line-quoted string `$match` from `$filteredline` (originally `$line`) is too short to process - skipping further processing of this token" );
+			next;
 		}
+
+		my $qu = substr( $match, 0, 1 );
+		my $te = substr( $match, -1, 1 );
+		if( $qu ne $te ) {
+			pdebug( "  S Found differing line-quoted string delimiters `$qu` and `$te` - skipping further processing of string `$match` from `$filteredline` (originally `$line`)" );
+			next;
+		} elsif( not( $qu =~ m/['"]/ ) ) {
+			pwarn( "  S Token string delimiter `$qu` is not recognised - skipping further processing of string `$match` from `$filteredline` (originally `$line`)" );
+			next;
+		}
+		# Keep external quotes...
+		$match =~ s/^$qu//;
+		$match =~ s/$te$//;
+
+		my $index = scalar( @linereplacements );
+		$filteredline =~ s/$qu\Q$match\E$te/${qu}__MW_LTOK_${index}__${te}/;
+		push( @linereplacements, $match );
+		pdebug( "  S Replacing line \`$match\` with \`__MW_LTOK_${index}__\` to give \`$filteredline\`" );
+	}
+
+	pdebug( "  \$ Splitting line `$filteredline` on `$delim` ..." );
+	foreach my $item ( split( /\Q$delim\E/, $filteredline ) ) {
+
+		if( $item =~ m/^\s*$/ ) {
+			if( $trailingdelim ) {
+				$trailingdelim = FALSE;
+			} else {
+				pdebug( "  S Skipping blank segment '$item' ..." );
+				next;
+			}
+		}
+
+		#pdebug( "  S Split item '$item' from line '$filteredline'..." );
 
 		# perl didn't like '\s' here...
 		my $term = "\Q$item\E[[:space:]]*\Q$delim\E";
-
-		if( $line =~ m/$term/ ) {
+		if( $filteredline =~ m/$term/ ) {
 			# $item contains a complete SQL statement, or the end
 			# of a previously started one...
 			#
-			my( $pre, $post ) = split( /\Q$delim\E/, $line, 2 );
+			my( $pre, $post ) = split( /\Q$delim\E/, $filteredline, 2 );
 			$pre =~ s/^\s+//; $pre =~ s/\s+$//;
 			$post =~ s/^\s+//; $post =~ s/\s+$//;
 
-			pdebug( "  S Complete or follow-on sections are '$pre' & '$post'" );
+			walk( $pre, sub {
+				my ( $strref, $varref ) = @_;
+
+				return if( not( length( ${ $strref } ) and ( ${ $strref } =~ m/__MW_(LTOK|LITERAL_QUOTE_)_/ ) ) );
+				#warn "WWW: strref is '$strref', refers to '" . ${ $strref } . "'";
+
+				my $original = ${ $strref };
+				if( ${ $strref } =~ s/__MW_LITERAL_QUOTE__/''/g ) {
+					pdebug( "  S Replaced \`__MW_LITERAL_QUOTE__\` from complete section \`$original\` with \`''\` to give \`${ $strref }\`" );
+				}
+
+				my @str = @{ $varref };
+				#warn "WWW: walk read " . scalar( @str ) . " parameters";
+				return if( not( scalar( @str ) ) );
+
+				for( my $index = ( scalar( @str ) - 1 ) ; $index >= 0 ; $index-- ) {
+					my $match = $str[ $index ];
+					#warn "WWW: walk read original string '$match'";
+					#warn( "Checking `$match`($index) against `${ $strref }` ...\n" );
+
+					if( defined( $match ) and length( $match ) ) {
+						$original = ${ $strref };
+						if( ${ $strref } =~ s/__MW_LTOK_${index}__/$match/ ) {
+							pdebug( "  S Replaced \`__MW_LTOK_${index}__\` from complete section \`$original\` with \`$match\` to give \`${ $strref }\`" );
+						}
+					}
+				}
+			}, \@linereplacements );
+			walk( $post, sub {
+				my ( $strref, $varref ) = @_;
+
+				return if( not( length( ${ $strref } ) and ( ${ $strref } =~ m/__MW_(LTOK|LITERAL_QUOTE_)_/ ) ) );
+				#warn "WWW: strref is '$strref', refers to '" . ${ $strref } . "'";
+
+				my $original = ${ $strref };
+				if( ${ $strref } =~ s/__MW_LITERAL_QUOTE__/''/g ) {
+					pdebug( "  S Replaced \`__MW_LITERAL_QUOTE__\` from follow-on section \`$original\` with \`''\` to give \`${ $strref }\`" );
+				}
+
+				my @str = @{ $varref };
+				#warn "WWW: walk read " . scalar( @str ) . " parameters";
+				return if( not( scalar( @str ) ) );
+
+				for( my $index = ( scalar( @str ) - 1 ) ; $index >= 0 ; $index-- ) {
+					my $match = $str[ $index ];
+					#warn "WWW: walk read original string '$match'";
+					#warn( "Checking `$match`($index) against `${ $strref }` ...\n" );
+
+					if( defined( $match ) and length( $match ) ) {
+						$original = ${ $strref };
+						if( ${ $strref } =~ s/__MW_LTOK_${index}__/$match/ ) {
+							pdebug( "  S Replaced \`__MW_LTOK_${index}__\` from follow-on section \`$original\` with \`$match\` to give \`${ $strref }\`" );
+						}
+					}
+				}
+			}, \@linereplacements );
+
+			pdebug( "  S Complete or follow-on sections are `$pre` & `$post`" );
 
 			pushfragment( $state -> { 'statements' }, 'statement', ( defined( $pre ) ? $pre : '' ) . $delim, 'SQL ending' );
 
@@ -3085,6 +3225,36 @@ sub processline( $$;$$ ) { # {{{
 			#
 			my $sqlparser = SQLParser -> new();
 			my $command = join( ' ', @{ $state -> { 'statements' } -> { 'entry' } } );
+
+			walk( $command, sub {
+				my ( $strref, $varref ) = @_;
+
+				return if( not( length( ${ $strref } ) and ( ${ $strref } =~ m/__MW_(TOK|LITERAL_QUOTE_)_/ ) ) );
+				#warn "WWW: strref is '$strref', refers to '" . ${ $strref } . "'";
+
+				my $original = ${ $strref };
+				if( ${ $strref } =~ s/__MW_LITERAL_QUOTE__/''/g ) {
+					pdebug( "  S Replaced \`__MW_LITERAL_QUOTE__\` from tokenised hash leaf value \`$original\` with \`''\` to give \`${ $strref }\`" );
+				}
+
+				my @str = @{ $varref };
+				#warn "WWW: walk read " . scalar( @str ) . " parameters";
+				return if( not( scalar( @str ) ) );
+
+				for( my $index = ( scalar( @str ) - 1 ) ; $index >= 0 ; $index-- ) {
+					my $match = $str[ $index ];
+					#warn "WWW: walk read original string '$match'";
+
+					if( defined( $match ) and length( $match ) ) {
+						$original = ${ $strref };
+						if( ${ $strref } =~ s/__MW_LTOK_${index}__/$match/ ) {
+							pdebug( "  S Replaced \`__MW_LTOK_${index}__\` from tokenised hash leaf value \`$original\` with \`$match\` to give \`${ $strref }\`" );
+						}
+					}
+				}
+			}, \@linereplacements );
+			pdebug( "  S Expanded command is '$command'." );
+
 			my $tokens;
 			if( $command =~ m/^USE\s+`?(.+?)`?$/i ) {
 				if( defined( $strict ) and $strict ) {
@@ -3156,27 +3326,16 @@ sub processline( $$;$$ ) { # {{{
 						$state -> { 'statements' } -> { 'tokens' } = undef;
 					}
 				} else {
-					sub walk( $$;$ );
-					sub walk( $$;$ ) { # {{{
-						my ( $element, $block, $vars ) = @_;
-
-						my $type = ref( $element );
-
-						if( 'HASH' eq $type ) {
-							walk( $_, $block, $vars ) for( values( %$element ) );
-						} elsif( 'ARRAY' eq $type ) {
-							walk( $_, $block, $vars ) for( @$element );
-						} elsif( ( 'SCALAR' eq $type ) or ( '' eq $type ) ) {
-							$block -> ( \$_[ 0 ], $vars );
-						} else {
-							die "Unknown type '$type'";
-						}
-					} # walk # }}}
 					walk( $tokens, sub {
 						my ( $strref, $varref ) = @_;
 
 						return if( not( length( ${ $strref } ) and ( ${ $strref } =~ m/__MW_TOK_/ ) ) );
 						#warn "WWW: strref is '$strref', refers to '" . ${ $strref } . "'";
+
+						my $original = ${ $strref };
+						if( ${ $strref } =~ s/__MW_LITERAL_QUOTE__/''/g ) {
+							pdebug( "  S Replaced \`__MW_LITERAL_QUOTE__\` from tokenised hash leaf value \`$original\` with \`''\` to give \`${ $strref }\`" );
+						}
 
 						my @str = @{ $varref };
 						#warn "WWW: walk read " . scalar( @str ) . " parameters";
@@ -3187,11 +3346,9 @@ sub processline( $$;$$ ) { # {{{
 							#warn "WWW: walk read original string '$match'";
 
 							if( defined( $match ) and length( $match ) ) {
-								my $original = ${ $strref };
+								$original = ${ $strref };
 								if( ${ $strref } =~ s/__MW_TOK_${index}__/$match/ ) {
 									pdebug( "  S Replaced \`__MW_TOK_${index}__\` from tokenised hash leaf value \`$original\` with \`$match\` to give \`${ $strref }\`" );
-								} elsif( ${ $strref } =~ s/__MW_LITERAL_QUOTE__/''/ ) {
-									pdebug( "  S Replaced \`__MW_LITERAL_QUOTE__\` from tokenised hash leaf value \`$original\` with \`''\` to give \`${ $strref }\`" );
 								}
 							}
 						}
@@ -3269,7 +3426,7 @@ sub processfile( $$;$$$ ) { # {{{
 
 			my $original = $line;
 			if( $line =~ s/$marker/$substitution/ ) {
-				print( "!> Substituted '$marker' for '$substitution' in string '$original'\n" );
+				print( "!> Substituted '$marker' for '$substitution' in string '$original'\n" ) unless( $reduceoutput );
 			}
 		}
 		# NB: $. contains the last-read line-number
@@ -3378,13 +3535,13 @@ sub dbclose( ;$$ ) { # {{{
 	$message = "Complete" unless( defined( $message ) and length( $message ) );
 
 	if( defined( $dbh ) and $dbh ) {
-		print( "\n=> $message - disconnecting from database ...\n" );
+		print( "\n=> $message - disconnecting from database ...\n" ) unless( $reduceoutput );
 		$dbh -> disconnect;
 	}
 
 	my( $sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst ) = localtime( time );
 	$year += 1900;
-	printf( "\n=> %s finished at %04d/%02d/%02d %02d:%02d.%02d\n\n", $0, $year, $mon, $mday, $hour, $min, $sec );
+	printf( "\n=> %s finished at %04d/%02d/%02d %02d:%02d.%02d\n\n", $0, $year, $mon, $mday, $hour, $min, $sec ) unless( $reduceoutput );
 
 	return( TRUE );
 } # dbclose # }}}
@@ -3608,11 +3765,11 @@ sub dbdump( $;$$$$$ ) { # {{{
 		my $dsn = "DBI:mysql:host=$host;port=$port";
 		my $dbh;
 		my $error = dbopen( \$dbh, $dsn, $user, $password, FALSE );
-		die( $error ."\n" ) if $error;
+		die( $error . "\n" ) if $error;
 
 		my $master = getsqlvalue( $dbh, 'SELECT @@log_bin' );
 
-		print( "\n=> Complete - disconnecting from database ...\n" );
+		print( "\n=> Complete - disconnecting from database ...\n" ) unless( $reduceoutput );
 		$dbh -> disconnect;
 
 		if( 1 == $master ) {
@@ -3779,6 +3936,13 @@ sub dosql( $$ ) { # {{{
 	#	die( "Not a database handle or handle state in error: $@" );
 	#}
 	return( undef ) unless( defined( $st ) and length( $st ) );
+
+	if( $st =~ m/__MW_(STR|L?TOK|LITERAL_QUOTE_)_/ ) {
+		warn "\nUnexpended token detected in `$st`\n";
+		my $trace = Devel::StackTrace -> new;
+		print $trace -> as_string;
+		return( FALSE );
+	}
 
 	pdebug( "SQL: Sending to database: \"$st\"" );
 	eval {
@@ -4050,7 +4214,7 @@ sub formatastable( $$$ ) { # {{{
 
 		while( my $line = $read -> getline() ) {
 			chomp( $line );
-			print( $indent . $line . "\n" );
+			print( $indent . $line . "\n" ) if( length( $line ) );
 		}
 		$read -> close();
 
@@ -4092,17 +4256,19 @@ sub applyschema( $$$$;$ ) { # {{{
 	$action_migrate = $actions -> { 'migrate' } if( exists( $actions -> { 'migrate' } ) );
 	$action_check   = $actions -> { 'check' }   if( exists( $actions -> { 'check' } ) );
 
-	my( $tmpdir, $mode, $marker, $first, $backupdir, $safetyoff, $strict, $unsafe, $desc, $pretend, $clear, $compat, $force );
-	$mode      = $variables -> { 'mode' }      if( exists( $variables -> { 'mode' } ) );
-	$marker    = $variables -> { 'marker' }    if( exists( $variables -> { 'marker' } ) );
-	$first     = $variables -> { 'first' }     if( exists( $variables -> { 'first' } ) );
+	my( $tmpdir, $mode, $marker, $first, $backupdir, $safetyoff, $strict, $unsafe, $desc, $pretend, $quiet, $silent, $clear, $compat, $force );
 	$backupdir = $variables -> { 'backupdir' } if( exists( $variables -> { 'backupdir' } ) );
 	$clear     = $variables -> { 'clear' }     if( exists( $variables -> { 'clear' } ) );
 	$compat    = $variables -> { 'compat' }    if( exists( $variables -> { 'compat' } ) );
 	$desc      = $variables -> { 'desc' }      if( exists( $variables -> { 'desc' } ) );
+	$first     = $variables -> { 'first' }     if( exists( $variables -> { 'first' } ) );
 	$force     = $variables -> { 'force' }     if( exists( $variables -> { 'force' } ) );
+	$marker    = $variables -> { 'marker' }    if( exists( $variables -> { 'marker' } ) );
+	$mode      = $variables -> { 'mode' }      if( exists( $variables -> { 'mode' } ) );
 	$pretend   = $variables -> { 'pretend' }   if( exists( $variables -> { 'pretend' } ) );
+	$quiet     = $variables -> { 'quiet' }     if( exists( $variables -> { 'quiet' } ) );
 	$safetyoff = $variables -> { 'safetyoff' } if( exists( $variables -> { 'safetyoff' } ) );
+	$silent    = $variables -> { 'silent' }    if( exists( $variables -> { 'silent' } ) );
 	$strict    = $variables -> { 'strict' }    if( exists( $variables -> { 'strict' } ) );
 	$tmpdir    = $variables -> { 'tmpdir' }    if( exists( $variables -> { 'tmpdir' } ) );
 	$unsafe    = $variables -> { 'unsafe' }    if( exists( $variables -> { 'unsafe' } ) );
@@ -4193,7 +4359,7 @@ sub applyschema( $$$$;$ ) { # {{{
 				if( $pretend ) {
 					print( "*> Would adjust Stored Procedure names with version string '$procedureversion'\n" );
 				} else {
-					print( "*> Will adjust Stored Procedure names with version string '$procedureversion'\n" );
+					print( "*> Adjusting Stored Procedure names with version string '$procedureversion'\n" ) unless( $quiet or $silent );
 				}
 			} else {
 				if( $force ) {
@@ -4213,7 +4379,7 @@ sub applyschema( $$$$;$ ) { # {{{
 		# the same versions.
 		my $metafile = dirname( $file ) . '/' . $db . '.metadata';
 		die( "Cannot read metadata '$db.metadata' for file '$file'\n" ) unless( -s $metafile );
-		print( "*> Using metadata file '$metafile'\n" );
+		print( "*> Using metadata file '$metafile'\n" ) unless( $quiet or $silent );
 
 		$invalid = $invalid | not( processfile( $metadata, $metafile, undef, undef, $strict ) );
 		die( "Metadata failed validation - aborting.\n" ) if( $invalid );
@@ -4254,7 +4420,7 @@ sub applyschema( $$$$;$ ) { # {{{
 	my $statements = 0;
 	foreach my $entry ( @{ $data -> { 'entries' } } ) {
 		if( not( 'HASH' eq ref( $entry ) ) ) {
-			print( "\$entry has unexpected type " .ref( $entry ) . "\n" );
+			print( "\$entry has unexpected type " . ref( $entry ) . "\n" );
 			$invalid = TRUE;
 		} else {
 			next unless( defined( $entry -> { 'type' } ) );
@@ -4324,26 +4490,28 @@ sub applyschema( $$$$;$ ) { # {{{
 				}
 			}
 
-			foreach my $key ( keys( $entry -> { 'tokens' } ) ) {
-				if( ref( $entry -> { 'tokens' } -> { $key } ) eq 'ARRAY' ) {
-					foreach my $element ( @{ $entry -> { 'tokens' } -> { $key } } ) {
-						if( ref( $element ) eq 'HASH' ) {
-							foreach my $basekey ( keys( %{ $element } ) ) {
-								# N.B.: This should never occur when ( $mode eq 'procedure' )...
-								if( $basekey eq 'tbl' ) {
-									my $table = $element -> { $basekey };
+			if( not( $unsafe ) ) {
+				foreach my $key ( keys( $entry -> { 'tokens' } ) ) {
+					if( ref( $entry -> { 'tokens' } -> { $key } ) eq 'ARRAY' ) {
+						foreach my $element ( @{ $entry -> { 'tokens' } -> { $key } } ) {
+							if( ref( $element ) eq 'HASH' ) {
+								foreach my $basekey ( keys( %{ $element } ) ) {
+									# N.B.: This should never occur when ( $mode eq 'procedure' )...
+									if( $basekey eq 'tbl' ) {
+										my $table = $element -> { $basekey };
 
-									# FIXME:  For input 'INSERT INTO `table`(`column1`,`column2`) VALUES ...',
-									#         Parser output still contains the specified attributes :(
-									# Update: Actually, it's worse - the parser thinks this is a huge inner-join.
-									# Update: Now fixed, hopefully...
-									#$table =~ s/\([^\)]*\)//g;
-									$table =~ s/`//g;
+										# FIXME:  For input 'INSERT INTO `table`(`column1`,`column2`) VALUES ...',
+										#         Parser output still contains the specified attributes :(
+										# Update: Actually, it's worse - the parser thinks this is a huge inner-join.
+										# Update: Now fixed, hopefully...
+										#$table =~ s/\([^\)]*\)//g;
+										$table =~ s/`//g;
 
-									#if( not( /^$table$/ ~~ @dumptables ) )
-									if( defined( $table ) and ( not( scalar( @dumptables ) and ( qr/^$table$/ |M| \@dumptables ) ) ) ) {
-										print( "=> Adding table `$table` to backup list ...\n" );
-										push( @dumptables, $table );
+										#if( not( /^$table$/ ~~ @dumptables ) )
+										if( defined( $table ) and ( not( scalar( @dumptables ) and ( qr/^$table$/ |M| \@dumptables ) ) ) ) {
+											print( "=> Adding table `$table` to backup list ...\n" );
+											push( @dumptables, $table );
+										}
 									}
 								}
 							}
@@ -4359,7 +4527,7 @@ sub applyschema( $$$$;$ ) { # {{{
 		# Still issue a warning, but don't abort here - placeholder
 		# schema should be allowed to fill gaps due to reorganisation.
 		#
-		warn( "!> No valid SQL statements found, but continuing for now ...\n" );
+		warn( "!> No valid SQL statements found, but continuing for now ...\n" ) unless( $silent );
 		#dbclose( undef, 'Nothing to do' );
 		#return( FALSE );
 	}
@@ -4385,7 +4553,7 @@ sub applyschema( $$$$;$ ) { # {{{
 	# Open target database connection
 	#
 
-	print( "\n=> Connecting to database `$db` ...\n" );
+	print( "\n=> Connecting to database `$db` ...\n" ) unless( $quiet or $silent );
 	my $dsn = "DBI:mysql:database=$db;host=$host;port=$port";
 	my $dbh;
 	my $error = dbopen( \$dbh, $dsn, $user, $pass, $strict );
@@ -4414,7 +4582,7 @@ sub applyschema( $$$$;$ ) { # {{{
 	my $installedrank;
 	my $versionrank;
 
-	print( "\n" ) unless( defined( $action_init ) );
+	print( "\n" ) unless( defined( $action_init ) or $quiet or $silent );
 
 	if( not( 'procedure' eq $mode ) ) {
 		#if( not( /^$flywaytablename$/ ~~ @{ $availabletables } ) )
@@ -4449,7 +4617,7 @@ sub applyschema( $$$$;$ ) { # {{{
 						if( $pretend ) {
 							warn( "!> Database `$db` has already been initialised to version '$version' - please use '--clear-metadata' to discard.\n" );
 						} else {
-							die( "$fatal Database `$db` has already been initialised to version '$version' - please use '--clear-metadata' to discard.\n" );
+							die( "Database `$db` has already been initialised to version '$version' - please use '--clear-metadata' to discard.\n" );
 						}
 					}
 				}
@@ -4545,7 +4713,7 @@ SQL
 				}
 				$sth -> finish();
 				}
-				if( not( $pretend ) ) {
+				if( not( $pretend or $quiet or $silent ) ) {
 					print( "\n*> flyway metadata table `$flywaytablename` has been initialised to version '$schmversion':\n" );
 					formatastable( $dbh, "SELECT * FROM $flywaytablename ORDER BY `version` DESC LIMIT 5", '   ' );
 				}
@@ -4583,11 +4751,11 @@ SQL
 					my $previous = pop( @sortedversions );
 					if( not( $force ) ) {
 						if( ( $match eq $latest ) and ( $latest eq $previous ) ) {
-							print( "=> Skipping base initialiser file '$schmfile' ...\n" );
+							print( "=> Skipping base initialiser file '$schmfile' ...\n" ) unless( $quiet or $silent );
 							dbclose( $dbh );
 							return( TRUE );
 						} elsif( $match eq $previous ) {
-							print( "=> Skipping pre-initialisation file '$schmfile' ...\n" );
+							print( "=> Skipping pre-initialisation file '$schmfile' ...\n" ) unless( $silent );
 							dbclose( $dbh );
 							return( TRUE );
 						}
@@ -4611,7 +4779,7 @@ SQL
 					if( $force ) {
 						warn( "!> Schema version '$schmversion' has already been applied to this database - forcibly re-applying ...\n" );
 					} else {
-						warn( "!> Schema version '$schmversion' has already been applied to this database - skipping ...\n\n" );
+						warn( "!> Schema version '$schmversion' has already been applied to this database - skipping ...\n\n" ) unless( $quiet or $silent );
 						return( TRUE );
 					}
 				}
@@ -4706,7 +4874,7 @@ SQL
 
 				my $availablesystemtables;
 
-				print( "\n=> Connecting to database `$systemdb` ...\n" );
+				print( "\n=> Connecting to database `$systemdb` ...\n" ) unless( $quiet or $silent );
 				my $systemdsn = "DBI:mysql:database=$systemdb;host=$host;port=$port";
 				my $systemdbh;
 				my $systemerror = dbopen( \$systemdbh, $systemdsn, $user, $pass, $strict );
@@ -4785,12 +4953,12 @@ SQL
 				print( "S> Would update myway timing metadata for invocation '$uuid' due to " . ( ( $dumpusers or( scalar( @dumptables ) ) ) ? "backups completed" : "SQL execution starting" ) . " ...\n" );
 			} else {
 				dosql( $dbh, "START TRANSACTION" ) or die( "Failed to start transaction\n" );
-				print( "=> Updating myway timing metadata for invocation '$uuid' due to " . ( ( $dumpusers or( scalar( @dumptables ) ) ) ? "backups completed" : "SQL execution starting" ) . " ...\n" );
+				print( "=> Updating myway timing metadata for invocation '$uuid' due to " . ( ( $dumpusers or( scalar( @dumptables ) ) ) ? "backups completed" : "SQL execution starting" ) . " ...\n" ) unless( $quiet or $silent );
 				my $sql = "UPDATE `$mywaytablename` SET `sqlstarted` = SYSDATE() WHERE `id` = '$uuid'";
 				dosql( $dbh, $sql ) or die( "Closing statement execution failed\n" );
 
 				if( 'procedure' eq $mode ) {
-					print( "=> Committing transaction data\n" );
+					print( "=> Committing transaction data\n" ) unless( $quiet or $silent );
 					dosql( $dbh, "COMMIT" ) or die( "Failed to commit transaction\n" );
 				}
 			}
@@ -4916,7 +5084,7 @@ SQL
 											if( $force or ( 'procedure' eq $mode ) ) {
 												warn( "!> " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " target version '$schmtarget' has already been applied to this database - forcibly applying ...\n" );
 											} else {
-												warn( "!> Schema target version '$schmtarget' has already been applied to this database - skipping ...\n" );
+												warn( "!> Schema target version '$schmtarget' has already been applied to this database - skipping ...\n" ) unless( $quiet or $silent );
 												return( TRUE );
 											}
 										}
@@ -4936,7 +5104,7 @@ SQL
 										} else {
 											warn( "!> Hot-fix Schema version '$schmtarget' will be applied onto existing Schema version '$latest' ...\n" );
 										}
-										print( "*> Schema version '$schmtarget' is a fresh install\n" );
+										print( "*> Schema version '$schmtarget' is a fresh install\n" ) unless( $silent );
 										$okay = TRUE;
 									} else {
 										if( $pretend ) {
@@ -4949,7 +5117,7 @@ SQL
 											if( $force ) {
 												warn( "!> Existing " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$latest' is greater than target '$schmtarget', and has already been applied to this database - forcibly applying ...\n" );
 											} else {
-												warn( "!> Existing " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$latest' is greater than target '$schmtarget', and has already been applied to this database - skipping ...\n" );
+												warn( "!> Existing " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$latest' is greater than target '$schmtarget', and has already been applied to this database - skipping ...\n" ) unless( $quiet or $silent );
 												return( TRUE );
 											}
 										}
@@ -4957,9 +5125,9 @@ SQL
 										$okay = FALSE;
 									}
 								} elsif( $fresh ) { # and ( $first )
-									print( "*> " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$schmtarget' is a fresh install\n" );
+									print( "*> " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$schmtarget' is a fresh install\n" ) unless( $silent );
 								} elsif( $first ) {
-									print( "*> " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$schmtarget' is a re-install\n" );
+									print( "*> " . ( ( 'procedure' eq $mode ) ? 'Stored Procedure' : 'Schema' ) . " version '$schmtarget' is a re-install\n" ) unless( $silent );
 								}
 								if( $okay ) {
 									$schmversion = $schmtarget;
@@ -4967,7 +5135,7 @@ SQL
 							}
 
 							if( not( defined( $schmprevious ) ) ) {
-								print( "*> No previous version defined in schema comments - not validating previous installation chain\n" );
+								print( "*> No previous version defined in schema comments - not validating previous installation chain\n" ) unless( $quiet or $silent );
 							#} elsif( not( /^$flywaytablename$/ ~~ @{ $availabletables } ) )
 							} elsif( defined( $tablename ) and not( qr/^$tablename$/ |M| \@{ $availabletables } ) ) {
 								warn( "!> metadata table `$tablename` does not exist - not validating previous installation chain\n" );
@@ -5114,14 +5282,14 @@ SQL
 
 						if( defined( $schmdescription ) and length( $schmdescription ) ) {
 							if( defined( $desc ) ) {
-								print( "*> Updating schema description from '$desc' to '$schmdescription'\n" );
+								print( "*> Updating schema description from '$desc' to '$schmdescription'\n" ) unless( $quiet or $silent );
 							} else {
-								print( "*> Updating schema description to '$schmdescription'\n" );
+								print( "*> Updating schema description to '$schmdescription'\n" ) unless( $quiet or $silent );
 							}
 							$desc = $schmdescription;
 						}
 
-						print( "\n" ) if( $verbosity );
+						print( "\n" ) if( $verbosity or not( $quiet or $silent ) );
 					} # }}}
 					foreach my $line ( @{ $statement -> { 'entry' } } ) {
 						chomp( $line );
@@ -5133,7 +5301,7 @@ SQL
 						#		dosql( $dbh, $line ) or die( "Statement execution failed\n" );
 						#	}
 						#} else {
-							print( " > " . $line . "\n" ) if( $verbosity );
+							print( " > " . $line . "\n" ) if( length( $line ) and ( $verbosity or not( $quiet or $silent ) ) );
 						#}
 					}
 				} else {
@@ -5147,7 +5315,7 @@ SQL
 					#		dosql( $dbh, $line ) or die( "Statement execution failed\n" );
 					#	}
 					#} else {
-						print( " > " . $line . "\n" ) if( $verbosity );
+						print( " > " . $line . "\n" ) if( length( $line ) and ( $verbosity or not( $quiet or $silent ) ) );
 					#}
 				} # }}}
 			} elsif( 'statement' eq $statement -> { 'type' } ) {
@@ -5170,7 +5338,7 @@ SQL
 							if( $pretend ) {
 								print( "S> Would commence new transaction\n" );
 							} else {
-								print( "=> Commencing new transaction\n" );
+								print( "=> Commencing new transaction\n" ) unless( $quiet or $silent );
 								dosql( $dbh, "START TRANSACTION" ) or die( "Failed to start transaction\n" );
 							}
 							$laststatementwasddl = FALSE;
@@ -5188,7 +5356,7 @@ SQL
 								if( $pretend ) {
 									print( "S> Would commit transaction data\n" );
 								} else {
-									print( "=> Committing transaction data\n" );
+									print( "=> Committing transaction data\n" ) unless( $quiet or $silent );
 									dosql( $dbh, "COMMIT" ) or die( "Failed to commit transaction\n" );
 								}
 								$laststatementwasddl = TRUE
@@ -5297,7 +5465,7 @@ SQL
 						if( $safetyoff ) {
 							my $started = getsqlvalue( $dbh, "SELECT `sqlstarted` FROM `$mywayprocsname` WHERE `id` = '$uuid'" );
 							if( not( defined( $started ) ) or ( 'NULL' eq $started ) ) {
-								print( "=> Updating myway timing metadata for stored procedure invocation '$uuid' due to creation commencing ...\n" );
+								print( "=> Updating myway timing metadata for stored procedure invocation '$uuid' due to creation commencing ...\n" ) unless( $quiet or $silent );
 								my $sql = "UPDATE `$mywayprocsname` SET `sqlstarted` = SYSDATE() WHERE `id` = '$uuid'";
 								dosql( $dbh, $sql ) or die( "Statement execution failed\n" );
 							}
@@ -5307,14 +5475,14 @@ SQL
 			} else {
 				die( "Unknown statement type '" . $statement -> { 'type' } . "'\n" );
 			}
-			print( "\n" ) if( $verbosity );
+			print( "\n" ) if( $verbosity or not( $quiet or $silent ) );
 		} # foreach my $statement ( @{ $entry } )
 
 		if( not( 'procedure' eq $mode ) ) {
 			if( $pretend ) {
 				print( "S> Would commit transaction data\n" );
 			} else {
-				print( "=> Committing transaction data\n" );
+				print( "=> Committing transaction data\n" ) unless( $quiet or $silent );
 				dosql( $dbh, "COMMIT" ) or die( "Failed to commit transaction\n" );
 			}
 		}
@@ -5332,7 +5500,7 @@ SQL
 		$status = 1 if( not( 'procedure' eq $mode ) );
 
 		dosql( $dbh, "START TRANSACTION" ) or die( "Failed to start transaction\n" );
-		print( "=> Updating myway metadata for invocation '$uuid' ...\n" );
+		print( "=> Updating myway metadata for invocation '$uuid' ...\n" ) unless( $quiet or $silent );
 		my $sql = "UPDATE `$tablename` SET `status` = '$status', `finished` = SYSDATE() WHERE `id` = '$uuid'";
 		dosql( $dbh, $sql ) or die( "Closing statement execution failed\n" );
 
@@ -5346,7 +5514,7 @@ SQL
 		if( $pretend ) {
 			print( "S> Would update " . ( 'procedure' eq $mode ? '' : 'flyway ' ) . "metadata with version '$schmversion' ...\n" );
 		} else {
-			print( "=> Updating " . ( 'procedure' eq $mode ? '' : 'flyway ' ) . "metadata with version '$schmversion' ...\n" );
+			print( "=> Updating " . ( 'procedure' eq $mode ? '' : 'flyway ' ) . "metadata with version '$schmversion' ...\n" ) unless( $quiet or $silent );
 		}
 		if( not( 'procedure' eq $mode ) ) {
 			{
@@ -5480,7 +5648,7 @@ sub main( @ ) { # {{{
 	my( $lock, $keeplock );
 	my( $force, $clear, $compress, $small, $split );
 	my( $user, $pass, $host, $db );
-	my( $pretend, $safetyoff, $debug, $notice, $verbose, $warn );
+	my( $pretend, $safetyoff, $debug, $silent, $quiet, $notice, $verbose, $warn );
 	my $ok = TRUE;
 	my $getoptout = undef;
 
@@ -5529,6 +5697,8 @@ sub main( @ ) { # {{{
 
 	,   'dry-run!'					=> \$pretend
 	,   'debug!'					=> \$debug
+	,   'silent!'					=> \$silent
+	, 'q|quiet!'					=> \$quiet
 	, 'n|notice!'					=> \$notice
 	, 'w|warn!'					=> \$warn
 	, 'v|verbose+'					=> \$verbose
@@ -5619,12 +5789,24 @@ sub main( @ ) { # {{{
 		$pretend = FALSE;
 		$safetyoff = TRUE;
 	}
+	if( defined( $quiet ) and $quiet ) {
+		$quiet = TRUE;
+		$reduceoutput = TRUE;
+	} else {
+		$quiet = FALSE;
+	}
 	if( defined( $relaxed ) and $relaxed ) {
 		$relaxed = TRUE;
 		$strict = FALSE;
 	} else {
 		$relaxed = FALSE;
 		$strict = TRUE;
+	}
+	if( defined( $silent ) and $silent ) {
+		$silent = TRUE;
+		$reduceoutput = TRUE;
+	} else {
+		$silent = FALSE;
 	}
 	if( defined( $small ) and $small ) {
 		$small = TRUE;
@@ -5841,10 +6023,10 @@ sub main( @ ) { # {{{
 
 					if( defined( $db ) and length( $db ) ) {
 						$dsn = "DBI:mysql:database=$db;host=$host;port=$port";
-						print( "\n=> Connecting to database `$db` ...\n" );
+						print( "\n=> Connecting to database `$db` ...\n" ) unless( $quiet or $silent );
 					} else {
 						$dsn = "DBI:mysql:host=$host;port=$port";
-						print( "\n=> Connecting to database instance ...\n" );
+						print( "\n=> Connecting to database instance ...\n" ) unless( $quiet or $silent );
 					}
 
 					my $error = dbopen( \$dbh, $dsn, $user, $pass, $strict );
@@ -5925,10 +6107,10 @@ sub main( @ ) { # {{{
 
 		if( defined( $db ) and length( $db ) ) {
 			$dsn = "DBI:mysql:database=$db;host=$host;port=$port";
-			print( "\n=> Connecting to database `$db` ...\n" );
+			print( "\n=> Connecting to database `$db` ...\n" ) unless( $quiet or $silent );
 		} else {
 			$dsn = "DBI:mysql:host=$host;port=$port";
-			print( "\n=> Connecting to database instance ...\n" );
+			print( "\n=> Connecting to database instance ...\n" ) unless( $quiet or $silent );
 		}
 
 		my $error = dbopen( \$dbh, $dsn, $user, $pass, $strict );
@@ -6154,11 +6336,13 @@ sub main( @ ) { # {{{
 		}
 	}
 
-	print( "=> Processing " . ( 'procedure' eq $mode ? 'Stored Procedures' : 'files' ) . ":\n" );
-	foreach my $item ( @files ) {
-		print( "=>  $item\n" );
+	if( not( $quiet or $silent ) ) {
+		print( "=> Processing " . ( 'procedure' eq $mode ? 'Stored Procedures' : 'files' ) . ":\n" );
+		foreach my $item ( @files ) {
+			print( "=>  $item\n" );
+		}
+		print( "\n" );
 	}
-	print( "\n" );
 
 	my $tmpdir;
 	if( $safetyoff and not( $unsafe ) ) {
@@ -6170,7 +6354,7 @@ sub main( @ ) { # {{{
 	{
 		my ( $sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst ) = localtime( time );
 		$year += 1900;
-		printf( "=> %s starting at %04d/%02d/%02d %02d:%02d.%02d\n\n", $0, $year, $mon, $mday, $hour, $min, $sec );
+		printf( "=> %s starting at %04d/%02d/%02d %02d:%02d.%02d\n\n", $0, $year, $mon, $mday, $hour, $min, $sec ) unless( $quiet or $silent );
 
 		my( $file, $path, $ext ) = fileparse( realpath( $0 ), qr/\.[^.]+/ );
 		$backupdir = sprintf( "%s-backup.%04d%02d%02d.%02d%02d%02d", $file, $year, $mon, $mday, $hour, $min, $sec );
@@ -6183,7 +6367,7 @@ sub main( @ ) { # {{{
 	#
 
 	if( defined( $action_init ) and $safetyoff ) {
-		print( "\n=> '--init' specified, ensuring that database `$db` exists ...\n" );
+		print( "\n=> '--init' specified, ensuring that database `$db` exists ...\n" ) unless( $quiet or $silent );
 		my $dsn = "DBI:mysql:host=$host;port=$port";
 		my $dbh;
 		my $error = dbopen( \$dbh, $dsn, $user, $pass, $strict, { RaiseError => 0, PrintError => 0 } );
@@ -6191,7 +6375,7 @@ sub main( @ ) { # {{{
 
 		dosql( $dbh, "CREATE DATABASE IF NOT EXISTS `$db`" ) or die( "Failed to create database: " . $dbh -> errstr() . "\n" );
 
-		print( "\n=> Disconnecting from database.\n" );
+		print( "\n=> Disconnecting from database.\n" ) unless( $quiet or $silent );
 		$dbh -> disconnect;
 	}
 
@@ -6201,7 +6385,7 @@ sub main( @ ) { # {{{
 	# Open mysql database connection to ensure metadata tables exist # {{{
 	#
 
-	print( "\n=> Connecting to database `$db` ...\n" );
+	print( "\n=> Connecting to database `$db` ...\n" ) unless( $quiet or $silent );
 	my $dsn = "DBI:mysql:database=$db;host=$host;port=$port";
 	my $dbh;
 	my $error = dbopen( \$dbh, $dsn, $user, $pass, $strict, { RaiseError => 0, PrintError => 0 } );
@@ -6253,23 +6437,40 @@ sub main( @ ) { # {{{
 		if( $pretend ) {
 			print( "\nS> Would ensure that $name `$tname` table exists.\n" );
 		} else {
-			print( "\n=> Ensuring that $name `$tname` table exists ...\n" );
+			print( "\n=> Ensuring that $name `$tname` table exists ...\n" ) unless( $quiet or $silent);
 			dosql( $dbh, $ddl ) or die( "Table creation failed\n" );
 
-			eval {
-				if( defined( $action ) and length( $action ) ) {
-					formatastable( $dbh, $action, '   ' );
-				} else {
-					formatastable( $dbh, "DESCRIBE `$tname`", '   ' );
-					#formatastable( $dbh, "SELECT * FROM `$tname`", '   ' );
+			if( $quiet or $silent ) {
+				eval {
+					if( defined( $action ) and length( $action ) ) {
+						dosql( $dbh, $action );
+					} else {
+						dosql( $dbh, "DESCRIBE `$tname`" );
+					}
+				};
+				if( $@ ) {
+					if( $pretend ) {
+						pwarn( "Table `$table` does not exist, but will be created on a full run" );
+					} else {
+						die( "Essential meta-data table `$table` is missing - cannot continue\n" );
+					}
 				}
-				print( "\n" );
-			};
-			if( $@ ) {
-				if( $pretend ) {
-					pwarn( "Table `$table` does not exist, but will be created on a full run" );
-				} else {
-					die( "Essential meta-data table `$table` is missing - cannot continue\n" );
+			} else {
+				eval {
+					if( defined( $action ) and length( $action ) ) {
+						formatastable( $dbh, $action, '   ' );
+					} else {
+						formatastable( $dbh, "DESCRIBE `$tname`", '   ' );
+						#formatastable( $dbh, "SELECT * FROM `$tname`", '   ' );
+					}
+					print( "\n" );
+				};
+				if( $@ ) {
+					if( $pretend ) {
+						pwarn( "Table `$table` does not exist, but will be created on a full run" );
+					} else {
+						die( "Essential meta-data table `$table` is missing - cannot continue\n" );
+					}
 				}
 			}
 
@@ -6365,7 +6566,7 @@ sub main( @ ) { # {{{
 		}
 	}
 
-	print( "\n=> Disconnecting from database.\n" );
+	print( "\n=> Disconnecting from database.\n" ) unless( $quiet or $silent );
 	$dbh -> disconnect;
 
 	# }}}
@@ -6380,16 +6581,18 @@ sub main( @ ) { # {{{
 	$actions -> { 'migrate' }     = $action_migrate;
 
 	my $variables;
-	$variables -> { 'mode' }      = $mode;
-	$variables -> { 'marker' }    = $marker if( $dosub );
-	$variables -> { 'first' }     =  not( 'procedure' eq $mode );
 	$variables -> { 'backupdir' } = $backupdir;
 	$variables -> { 'clear' }     = $clear;
 	$variables -> { 'compat' }    = $compat;
 	$variables -> { 'desc' }      = $desc;
+	$variables -> { 'first' }     =  not( 'procedure' eq $mode );
 	$variables -> { 'force' }     = $force;
+	$variables -> { 'marker' }    = $marker if( $dosub );
+	$variables -> { 'mode' }      = $mode;
 	$variables -> { 'pretend' }   = $pretend;
+	$variables -> { 'quiet' }     = $quiet;
 	$variables -> { 'safetyoff' } = $safetyoff;
+	$variables -> { 'silent' }    = $silent;
 	$variables -> { 'strict' }    = $strict;
 	$variables -> { 'tmpdir' }    = $tmpdir;
 	$variables -> { 'unsafe' }    = $unsafe;
@@ -6401,7 +6604,7 @@ sub main( @ ) { # {{{
 
 		foreach my $item ( @files ) {
 			if( -r $item ) {
-				print "*> Processing file '$item' ...\n";
+				print "*> Processing file '$item' ...\n" unless( $quiet or $silent );
 				eval {
 					if( defined( $version ) ) {
 						$version = applyschema( $item, $actions, $variables, $auth, $version );
@@ -6413,7 +6616,7 @@ sub main( @ ) { # {{{
 							die( "applyversion() returned undef\n" );
 						}
 					} elsif( ref( $version ) eq 'SCALAR' ) {
-						print( "*> This session now has base version '${ $version }'\n" );
+						print( "*> This session now has base version '${ $version }'\n" ) unless( $quiet or $silent );
 					} elsif( ref( $version ) eq '' ) {
 						if( not( $version ) ) {
 							die( "applyschema() failed\n" );
