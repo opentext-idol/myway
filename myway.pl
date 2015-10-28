@@ -2221,7 +2221,7 @@ no if ( $] >= 5.02 ), warnings => 'experimental::autoderef';
 # ... in actual fact, diagnostics causes more problems than it solves.  It does
 # appear to be, in reality, quite silly.
 
-use constant VERSION  =>  1.0.12;
+use constant VERSION  =>  1.0.13;
 
 use constant TRUE     =>  1;
 use constant FALSE    =>  0;
@@ -2264,7 +2264,8 @@ use Sort::Versions;
 use Time::HiRes qw( gettimeofday tv_interval );
 
 use Data::Dumper;
-use Devel::StackTrace;
+#use Devel::StackTrace; # Core with Perl 5.20, apparently not present on Ubuntu
+                        # 14.04 LTS release.
 
 # Modules not currently used in latest code:
 #use Clone qw( clone );
@@ -2618,8 +2619,8 @@ sub pushentry( $$$$$;$ ) { # {{{
 
 	if( $entry =~ m/__MW_(STR|L?TOK|LITERAL_QUOTE_)_/ ) {
 		warn "\nUnexpended token detected in `$entry`\n";
-		my $trace = Devel::StackTrace -> new;
-		print $trace -> as_string;
+		#my $trace = Devel::StackTrace -> new;
+		#print $trace -> as_string;
 		die "Tokenisation failed\n";
 	}
 
@@ -2682,8 +2683,8 @@ sub pushfragment( $$$;$$ ) { # {{{
 
 	if( $entry =~ m/__MW_(STR|L?TOK|LITERAL_QUOTE_)_/ ) {
 		warn "\nUnexpended token detected in `$entry`\n";
-		my $trace = Devel::StackTrace -> new;
-		print $trace -> as_string;
+		#my $trace = Devel::StackTrace -> new;
+		#print $trace -> as_string;
 		die "Tokenisation failed\n";
 	}
 
@@ -3159,8 +3160,11 @@ sub processline( $$;$$ ) { # {{{
 
 				for( my $index = ( scalar( @str ) - 1 ) ; $index >= 0 ; $index-- ) {
 					my $match = $str[ $index ];
+					$match =~ s/__MW_LITERAL_QUOTE__/''/g;
 					#warn "WWW: walk read original string '$match'";
 					#warn( "Checking `$match`($index) against `${ $strref }` ...\n" );
+
+					# FIXME: It may be possible that a token might expand to a string containing another token, in which case we intentionally break...
 
 					if( defined( $match ) and length( $match ) ) {
 						$original = ${ $strref };
@@ -3187,8 +3191,11 @@ sub processline( $$;$$ ) { # {{{
 
 				for( my $index = ( scalar( @str ) - 1 ) ; $index >= 0 ; $index-- ) {
 					my $match = $str[ $index ];
+					$match =~ s/__MW_LITERAL_QUOTE__/''/g;
 					#warn "WWW: walk read original string '$match'";
 					#warn( "Checking `$match`($index) against `${ $strref }` ...\n" );
+
+					# FIXME: It may be possible that a token might expand to a string containing another token, in which case we intentionally break...
 
 					if( defined( $match ) and length( $match ) ) {
 						$original = ${ $strref };
@@ -3243,7 +3250,10 @@ sub processline( $$;$$ ) { # {{{
 
 				for( my $index = ( scalar( @str ) - 1 ) ; $index >= 0 ; $index-- ) {
 					my $match = $str[ $index ];
+					$match =~ s/__MW_LITERAL_QUOTE__/''/g;
 					#warn "WWW: walk read original string '$match'";
+
+					# FIXME: It may be possible that a token might expand to a string containing another token, in which case we intentionally break...
 
 					if( defined( $match ) and length( $match ) ) {
 						$original = ${ $strref };
@@ -3343,7 +3353,10 @@ sub processline( $$;$$ ) { # {{{
 
 						for( my $index = ( scalar( @str ) - 1 ) ; $index >= 0 ; $index-- ) {
 							my $match = $str[ $index ];
+							$match =~ s/__MW_LITERAL_QUOTE__/''/g;
 							#warn "WWW: walk read original string '$match'";
+
+							# FIXME: It may be possible that a token might expand to a string containing another token, in which case we intentionally break...
 
 							if( defined( $match ) and length( $match ) ) {
 								$original = ${ $strref };
@@ -3381,6 +3394,14 @@ sub processline( $$;$$ ) { # {{{
 
 			$line =~ s/^\s+//;
 			$line =~ s/\s+$//;
+
+			# FIXME: This /should/ be handled when read back out...
+			#
+			#my $original = $line;
+			#if( $line =~ s/__MW_LITERAL_QUOTE__/''/g ) {
+			#	pdebug( "  S Replaced \`__MW_LITERAL_QUOTE__\` from fragment \`$original\` with \`''\` to give \`$line\`" );
+			#}
+
 			pdebug( "  S New statement or fragment is '$line'" );
 
 			if( 0 == $state -> { 'statements' } -> { 'depth' } ) {
@@ -3939,8 +3960,8 @@ sub dosql( $$ ) { # {{{
 
 	if( $st =~ m/__MW_(STR|L?TOK|LITERAL_QUOTE_)_/ ) {
 		warn "\nUnexpended token detected in `$st`\n";
-		my $trace = Devel::StackTrace -> new;
-		print $trace -> as_string;
+		#my $trace = Devel::StackTrace -> new;
+		#print $trace -> as_string;
 		return( FALSE );
 	}
 
@@ -4352,28 +4373,6 @@ sub applyschema( $$$$;$ ) { # {{{
 	my @dumptables = ();
 
 	if( 'procedure' eq $mode ) {
-		if( defined( $marker ) and length( $marker ) ) {
-			$procedureversion = $1 if( dirname( $file ) =~ m/^(?:.*?)(_v\d+_\d+)$/ );
-			if( defined( $procedureversion ) ) {
-				$procedureversion .= '` ';
-				if( $pretend ) {
-					print( "*> Would adjust Stored Procedure names with version string '$procedureversion'\n" );
-				} else {
-					print( "*> Adjusting Stored Procedure names with version string '$procedureversion'\n" ) unless( $quiet or $silent );
-				}
-			} else {
-				if( $force ) {
-					warn( "!> Cannot determine Stored Procedure version string - removing versioning\n" );
-				} else {
-					if( $pretend ) {
-						warn( "!> Cannot determine Stored Procedure version string - would abort unless forced\n" );
-					} else {
-						die( "$fatal Cannot determine Stored Procedure version string from directory '" . dirname( $file ) . "' - aborting\n" );
-					}
-				}
-			}
-		}
-
 		# In this case, we retrieve the previous/current-version logic
 		# from the metadata file, and many files may be applied with
 		# the same versions.
@@ -4387,12 +4386,52 @@ sub applyschema( $$$$;$ ) { # {{{
 		my $okay = TRUE;
 		foreach my $entry ( $metadata -> { 'entries' } ) {
 			foreach my $statement ( @{ $entry } ) {
-				if( $okay and not( 'comment' eq $statement -> { 'type' } ) ) {
+				if( 'comment' eq $statement -> { 'type' } ) {
+					if( defined( $marker ) and length( $marker ) ) {
+						if( 'ARRAY' eq ref( $statement -> { 'entry' } ) ) { # {{{
+							foreach my $line ( @{ $statement -> { 'entry' } } ) {
+								chomp( $line );
+								if( $line =~ m/Target\s+version:\s+([^\s]+)\s*/i ) {
+									$procedureversion = "_v${1}` ";
+									$procedureversion =~ s/\./_/g;
+									if( $pretend ) {
+										print( "*> Would adjust Stored Procedure names with version string '$procedureversion' from metadata\n" );
+									} else {
+										print( "*> Adjusting Stored Procedure names with version string '$procedureversion' from metadata\n" ) unless( $quiet or $silent );
+									}
+								}
+							}
+						}
+					}
+				} elsif( $okay ) {
 					$okay = FALSE;
 					warn( "!> Metadata contains non-comment code which will be executed for each file\n" );
 				}
 			}
 		}
+
+		if( not( defined( $procedureversion ) and length( $procedureversion ) ) and defined( $marker ) and length( $marker ) ) {
+			$procedureversion = $1 if( dirname( $file ) =~ m/^(?:.*?)(_v\d+_\d+)$/ );
+			if( defined( $procedureversion ) ) {
+				$procedureversion .= '` ';
+				if( $pretend ) {
+					print( "*> Would adjust Stored Procedure names with version string '$procedureversion' from path\n" );
+				} else {
+					print( "*> Adjusting Stored Procedure names with version string '$procedureversion' from path\n" ) unless( $quiet or $silent );
+				}
+			} else {
+				if( $force ) {
+					warn( "!> Cannot determine Stored Procedure version string from metadata or path - removing versioning\n" );
+				} else {
+					if( $pretend ) {
+						warn( "!> Cannot determine Stored Procedure version string from metadata or path - would abort unless forced\n" );
+					} else {
+						die( "$fatal Cannot determine Stored Procedure version string from metadata or directory '" . dirname( $file ) . "' - aborting\n" );
+					}
+				}
+			}
+		}
+
 	}
 
 	if( ( 'procedure' eq $mode ) and defined( $marker ) and length( $marker ) ) {
