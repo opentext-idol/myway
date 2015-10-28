@@ -2996,7 +2996,11 @@ sub processline( $$;$$ ) { # {{{
 	# comment - however, it transpires that hints can correctly appear
 	# within a statement also, so we'll just have to return any hint-like
 	# data as-is.  Hopefully this will be safe...
-	if( $line =~ m#(^|\s+)/\*![0-9]{5} .+ \*/(\s+|;\s*$)# ) {
+	#if( $line =~ m#(^|\s+)/\*![0-9]{5} .+ \*/(\s+|;\s*$)# ) {
+	# Be less specific here (especially since we don't yet know what the
+	# delimiter will be without shifting the code below around), at the
+	# potential risk of not identifying especially unusual comments...
+	if( $line =~ m#(^|\s+)/\*![0-9]{5} .+ \*/# ) {
 		pdebug( "  * Not processing text with hint '$line' for comments ..." );
 	} else {
 		pdebug( "  * Start processing text '$line' ..." );
@@ -5424,14 +5428,11 @@ SQL
 					$line =~ s/^\s+//;
 					$line =~ s/\s+$//;
 					if( $verbosity ) {
-						if( $line =~ m:^(.*)/\*![0-9]{5} (.+) \*/;?(.*)$: ) {
-							my $statement = '';
-							$statement .= $1 if( defined( $1 ) and length( $1 ) );
-							$statement .= $3 if( defined( $3 ) and length( $3 ) );
-							print( "-> Hint: " . $2 . "\n" );
-							print( "-> " . $statement . "\n" ) if( length( $statement ) );
-						} else {
-							print( "-> " . $line . "\n" );
+						print( "-> " . $line . "\n" );
+						foreach my $match ( ( $line =~ m/$RE{ balanced }{ -begin => '\/*' }{ -end => '*\/' }/g ) ) {
+							if( $match =~ m:^/\*![0-9]{5} (.+) \*/$: ) {
+								print( "-> Hint: " . $1 . "\n" );
+							}
 						}
 					}
 
